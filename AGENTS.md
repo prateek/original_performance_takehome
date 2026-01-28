@@ -24,6 +24,7 @@ possible **without changing the tests**.
 - Local cycle test: `python perf_takehome.py Tests.test_kernel_cycles`
 - Produce a trace: `python perf_takehome.py Tests.test_kernel_trace`
 - Watch the trace (Chrome recommended): `python watch_trace.py`
+- Run the Ralph loop: `./ralph-loop.sh <iterations>`
 
 Before submitting/sharing results:
 
@@ -52,6 +53,28 @@ Before submitting/sharing results:
 - The submission harness disables pause/debug (`enable_pause = False`,
   `enable_debug = False`), so debug slots may help locally but must not be
   required for correctness.
+
+## Ralph Loop & Logs
+
+- `ralph-loop.sh` runs a repeated “pick one task → implement → test → commit”
+  loop driven by `PRD.md` + `progress.md`.
+- It writes an append‑only worklog at `./.logs/ralph-worklog.md` with a per‑iteration
+  summary of what happened (did/tried/worked/didn’t/next) plus pointers to the
+  raw logs.
+- Raw logs:
+  - `./.logs/iterations.log` (combined Codex output)
+  - `./.logs/iteration-<n>.codex.log` (per-iteration Codex output)
+  - `./.logs/iteration-<n>.cycles.log` (cycle measurement output)
+- If a GitHub PR exists for the current branch, `ralph-loop.sh` comments at the
+  start/end of each iteration and updates the PR body with a small “Ralph status”
+  block.
+
+## AGENTS.md vs PRD.md
+
+- `AGENTS.md`: stable **“how to work here”** guidance — repo map, safety rules,
+  commands, and workflow constraints for any agent/human.
+- `PRD.md`: living **“what to do next”** document — prioritized task list,
+  performance targets, and a short progress narrative used by `ralph-loop.sh`.
 
 ## Requirements
 
