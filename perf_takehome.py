@@ -294,6 +294,8 @@ class KernelBuilder:
         n_groups = batch_size // VLEN
         idx_ptrs = self.alloc_scratch("idx_ptrs", n_groups)
         val_ptrs = self.alloc_scratch("val_ptrs", n_groups)
+        idx_cache = self.alloc_scratch("idx_cache", batch_size)
+        val_cache = self.alloc_scratch("val_cache", batch_size)
         for g in range(n_groups):
             off_const = self.scratch_const(g * VLEN)
             body.append(
@@ -303,42 +305,44 @@ class KernelBuilder:
                 ("alu", ("+", val_ptrs + g, self.scratch["inp_values_p"], off_const))
             )
 
+        # Cache idx/val in scratch to avoid per-round vload/vstore traffic.
+        for g in range(n_groups):
+            body.append(("load", ("vload", idx_cache + g * VLEN, idx_ptrs + g)))
+            body.append(("load", ("vload", val_cache + g * VLEN, val_ptrs + g)))
+
         for round in range(rounds):
             for g in range(n_groups):
-                idx_ptr = idx_ptrs + g
-                val_ptr = val_ptrs + g
-
-                # idx = mem[inp_indices_p + i : i+VLEN]
-                body.append(("load", ("vload", tmp_idx, idx_ptr)))
-                # val = mem[inp_values_p + i : i+VLEN]
-                body.append(("load", ("vload", tmp_val, val_ptr)))
+                idx_base = idx_cache + g * VLEN
+                val_base = val_cache + g * VLEN
 
                 # tmp_addr[v] = forest_values_p + idx[v]
-                body.append(("valu", ("+", tmp_addr, forest_values_p_vec, tmp_idx)))
+                body.append(("valu", ("+", tmp_addr, forest_values_p_vec, idx_base)))
                 # tmp_idx_dbl[v] = 2 * idx[v]
-                body.append(("valu", ("+", tmp_idx_dbl, tmp_idx, tmp_idx)))
+                body.append(("valu", ("+", tmp_idx_dbl, idx_base, idx_base)))
 
                 # node_val[v] = mem[forest_values_p + idx[v]] (gather)
                 for off in range(VLEN):
                     body.append(("load", ("load_offset", tmp_node_val, tmp_addr, off)))
 
                 # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash_vec(tmp_val, tmp_hash1, tmp_hash2, vec_const_map))
+                body.append(("valu", ("^", val_base, val_base, tmp_node_val)))
+                body.extend(
+                    self.build_hash_vec(val_base, tmp_hash1, tmp_hash2, vec_const_map)
+                )
 
                 # idx = 2*idx + (1 + (val & 1))
-                body.append(("valu", ("&", tmp_step, tmp_val, one_vec)))
+                body.append(("valu", ("&", tmp_step, val_base, one_vec)))
                 body.append(("valu", ("+", tmp_step, tmp_step, one_vec)))
-                body.append(("valu", ("+", tmp_idx, tmp_idx_dbl, tmp_step)))
+                body.append(("valu", ("+", idx_base, tmp_idx_dbl, tmp_step)))
 
                 # idx = idx if idx < n_nodes else 0  (masking avoids flow bottleneck)
-                body.append(("valu", ("<", tmp_mask, tmp_idx, n_nodes_vec)))
-                body.append(("valu", ("*", tmp_idx, tmp_idx, tmp_mask)))
+                body.append(("valu", ("<", tmp_mask, idx_base, n_nodes_vec)))
+                body.append(("valu", ("*", idx_base, idx_base, tmp_mask)))
 
-                # mem[inp_indices_p + i : i+VLEN] = idx
-                body.append(("store", ("vstore", idx_ptr, tmp_idx)))
-                # mem[inp_values_p + i : i+VLEN] = val
-                body.append(("store", ("vstore", val_ptr, tmp_val)))
+        # Write back cached idx/val once at the end.
+        for g in range(n_groups):
+            body.append(("store", ("vstore", idx_ptrs + g, idx_cache + g * VLEN)))
+            body.append(("store", ("vstore", val_ptrs + g, val_cache + g * VLEN)))
 
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
