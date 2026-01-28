@@ -541,10 +541,9 @@ class KernelBuilder:
                         state[g_flow] = IDX_MAD
                         ready[g_flow] = cycle + 1
 
-            # store engine: once a group completes all rounds, write back values.
-            # (Submission tests only validate output values, not indices.)
+            # store engine: once a group completes all rounds, write it back (1 group/cycle).
             store_budget = SLOT_LIMITS["store"]
-            while store_budget > 0:
+            if store_budget >= 2:
                 g_store = None
                 for _ in range(len(store_queue)):
                     cand = store_queue[0]
@@ -554,15 +553,15 @@ class KernelBuilder:
                         break
                     store_queue.append(store_queue.popleft())
 
-                if g_store is None:
-                    break
-
-                instr_store.append(
-                    ("vstore", val_ptrs + g_store, val_cache + g_store * VLEN)
-                )
-                state[g_store] = DONE
-                done_count += 1
-                store_budget -= 1
+                if g_store is not None:
+                    instr_store.append(
+                        ("vstore", idx_ptrs + g_store, idx_cache + g_store * VLEN)
+                    )
+                    instr_store.append(
+                        ("vstore", val_ptrs + g_store, val_cache + g_store * VLEN)
+                    )
+                    state[g_store] = DONE
+                    done_count += 1
 
             instr: dict[str, list[tuple]] = {}
             if instr_valu:
