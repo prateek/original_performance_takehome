@@ -273,10 +273,14 @@ class KernelBuilder:
         two_const = scratch_const_packed(2)
         zero_const = scratch_const_packed(0)
         stride_const = scratch_const_packed(VLEN)
+        mul33_const = scratch_const_packed(33)
+        mul4097_const = scratch_const_packed(4097)
 
         one_vec = self.alloc_scratch("one_vec", VLEN)
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
         two_vec = self.alloc_scratch("two_vec", VLEN)
+        mul33_vec = self.alloc_scratch("mul33_vec", VLEN)
+        mul4097_vec = self.alloc_scratch("mul4097_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         forest_values_p_vec = self.alloc_scratch("forest_values_p_vec", VLEN)
         # Hot node constants for fast-path rounds (root + depth-1).
@@ -287,6 +291,8 @@ class KernelBuilder:
         vector_slots: list[tuple[Engine, tuple]] = [
             ("valu", ("vbroadcast", one_vec, one_const)),
             ("valu", ("vbroadcast", two_vec, two_const)),
+            ("valu", ("vbroadcast", mul33_vec, mul33_const)),
+            ("valu", ("vbroadcast", mul4097_vec, mul4097_const)),
             ("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])),
             ("valu", ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"])),
         ]
@@ -301,6 +307,12 @@ class KernelBuilder:
                 v_vec = self.alloc_scratch(f"const_{v:x}_vec", VLEN)
                 vector_slots.append(("valu", ("vbroadcast", v_vec, v_scalar)))
                 vec_const_map[v] = v_vec
+
+        fused_mul_vec_by_stage: dict[int, int] = {
+            0: mul4097_vec,
+            2: mul33_vec,
+            4: vec_const_map[9],
+        }
 
         self.instrs.extend(self.build(const_slots, vliw=True))
         self.instrs.extend(self.build(vector_slots, vliw=True))
@@ -364,6 +376,7 @@ class KernelBuilder:
         IDX_SELECT = 12
         STORE_OUT = 13
         DONE = 14
+        HASH_FUSED = 15
 
         period = forest_height + 1
         state = [ROOT_XOR for _ in range(n_groups)]
@@ -475,9 +488,33 @@ class KernelBuilder:
                     t2 = tmp_hash2_arr + g * VLEN
                     op2 = HASH_STAGES[hash_stage[g]][2]
                     instr_valu.append((op2, val_base, t1, t2))
-                    if hash_stage[g] + 1 < len(HASH_STAGES):
-                        hash_stage[g] += 1
-                        state[g] = HASH_TMP
+                    next_stage = hash_stage[g] + 1
+                    if next_stage < len(HASH_STAGES):
+                        hash_stage[g] = next_stage
+                        state[g] = (
+                            HASH_FUSED if next_stage in fused_mul_vec_by_stage else HASH_TMP
+                        )
+                    else:
+                        state[g] = STEP_AND
+                    ready[g] = cycle + 1
+                    valu_budget -= 1
+                    continue
+
+                g = find_ready(HASH_FUSED)
+                if g is not None:
+                    val_base = val_cache + g * VLEN
+                    stage_idx = hash_stage[g]
+                    mul_vec = fused_mul_vec_by_stage[stage_idx]
+                    val1 = HASH_STAGES[stage_idx][1]
+                    instr_valu.append(
+                        ("multiply_add", val_base, val_base, mul_vec, vec_const_map[val1])
+                    )
+                    next_stage = stage_idx + 1
+                    if next_stage < len(HASH_STAGES):
+                        hash_stage[g] = next_stage
+                        state[g] = (
+                            HASH_FUSED if next_stage in fused_mul_vec_by_stage else HASH_TMP
+                        )
                     else:
                         state[g] = STEP_AND
                     ready[g] = cycle + 1
@@ -521,12 +558,12 @@ class KernelBuilder:
                     if st == XOR:
                         instr_valu.append(("^", val_base, val_base, node_base))
                         hash_stage[g] = 0
-                        state[g] = HASH_TMP
+                        state[g] = HASH_FUSED if 0 in fused_mul_vec_by_stage else HASH_TMP
                         ready[g] = cycle + 1
                     elif st == ROOT_XOR:
                         instr_valu.append(("^", val_base, val_base, node0_vec))
                         hash_stage[g] = 0
-                        state[g] = HASH_TMP
+                        state[g] = HASH_FUSED if 0 in fused_mul_vec_by_stage else HASH_TMP
                         ready[g] = cycle + 1
                     elif st == DEPTH1_MASK:
                         # idx is guaranteed in {1,2}; mask = idx&1.
