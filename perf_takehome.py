@@ -362,7 +362,11 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self,
+        forest_height: int,
+        n_nodes: int,
+        batch_size: int,
+        rounds: int,
     ):
         """
         Like reference_kernel2 but building actual instructions.
@@ -578,8 +582,19 @@ class KernelBuilder:
         g_round = [0 for _ in range(n_groups)]
         # Stagger group start times to smooth load demand and reduce pipeline
         # fill/drain bubbles (groups are independent).
-        start_spacing = 14
-        ready = [g * start_spacing for g in range(n_groups)]
+        #
+        # A piecewise schedule starts the first few groups closer together to
+        # fill the valu pipeline early, then uses a wider spacing for the rest
+        # to maintain a steady load/valu overlap once gathers begin.
+        early_groups = 4
+        early_spacing = 4
+        late_spacing = 16
+        ready = [
+            (g * early_spacing)
+            if g < early_groups
+            else (early_groups * early_spacing + (g - early_groups) * late_spacing)
+            for g in range(n_groups)
+        ]
         hash_stage = [0 for _ in range(n_groups)]
         postload_xor_off = [0 for _ in range(n_groups)]
 

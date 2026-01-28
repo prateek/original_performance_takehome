@@ -19,3 +19,4 @@
 2026-01-28: Preload `val_cache` + materialize `val_ptrs` with 4 independent pointer streams (blocks of 8 groups) to remove the 32-step scalar chain; retuned `start_spacing` to 14; submission cycles now 1418.
 2026-01-28: Upgrade VLIW slot packing in `KernelBuilder.build` to a dependency-aware list scheduler (RAW/WAW + WAR) to reorder independent slots for tighter bundling; submission cycles now 1414.
 2026-01-28: Pack const loads + vbroadcasts + setup/caching slots into one VLIW build to overlap load/alu/valu; submission cycles now 1409.
+2026-01-28: Retune group start staggering (piecewise start offsets) to reduce pipeline fill bubbles; submission cycles now 1391.
