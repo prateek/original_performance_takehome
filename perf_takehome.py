@@ -275,6 +275,10 @@ class KernelBuilder:
         two_vec = self.alloc_scratch("two_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         forest_values_p_vec = self.alloc_scratch("forest_values_p_vec", VLEN)
+        # Hot node constants for fast-path rounds (root + depth-1).
+        node0_vec = self.alloc_scratch("node0_vec", VLEN)
+        node2_vec = self.alloc_scratch("node2_vec", VLEN)
+        node1_minus_node2_vec = self.alloc_scratch("node1_minus_node2_vec", VLEN)
 
         vector_slots: list[tuple[Engine, tuple]] = [
             ("valu", ("vbroadcast", one_vec, one_const)),
@@ -304,10 +308,20 @@ class KernelBuilder:
         idx_cache = self.alloc_scratch("idx_cache", batch_size)
         val_cache = self.alloc_scratch("val_cache", batch_size)
         node_cache = self.alloc_scratch("node_cache", batch_size)
-        tmp_hash1_arr = self.alloc_scratch("tmp_hash1_arr", batch_size)
         tmp_hash2_arr = self.alloc_scratch("tmp_hash2_arr", batch_size)
         addr_buf0 = self.alloc_scratch("addr_buf0", VLEN)
         addr_buf1 = self.alloc_scratch("addr_buf1", VLEN)
+        # Load small, frequently-used forest nodes once and materialize vectors for
+        # fast-path rounds where indices are known to be in {0,1,2}.
+        body.append(("alu", ("+", tmp2, self.scratch["forest_values_p"], one_const)))
+        body.append(("alu", ("+", tmp3, self.scratch["forest_values_p"], two_const)))
+        body.append(("load", ("load", tmp1, self.scratch["forest_values_p"])))
+        body.append(("load", ("load", tmp2, tmp2)))
+        body.append(("load", ("load", tmp3, tmp3)))
+        body.append(("valu", ("vbroadcast", node0_vec, tmp1)))
+        body.append(("valu", ("vbroadcast", node2_vec, tmp3)))
+        body.append(("valu", ("vbroadcast", node1_minus_node2_vec, tmp2)))
+        body.append(("valu", ("-", node1_minus_node2_vec, node1_minus_node2_vec, node2_vec)))
         body.append(("alu", ("+", idx_ptrs + 0, self.scratch["inp_indices_p"], zero_const)))
         body.append(("alu", ("+", val_ptrs + 0, self.scratch["inp_values_p"], zero_const)))
         for g in range(1, n_groups):
@@ -333,25 +347,29 @@ class KernelBuilder:
         # Per-group state machine. Groups are independent, so we can interleave rounds.
         LOAD = 0
         PREFETCHED = 1
-        XOR = 2
-        HASH_TMP = 3
-        HASH_COMB = 4
-        STEP_AND = 5
-        STEP_SELECT = 6
-        IDX_MAD = 7
-        MASK_LT = 8
-        IDX_SELECT = 9
-        STORE_OUT = 10
-        DONE = 11
+        ROOT_XOR = 2
+        DEPTH1_MASK = 3
+        DEPTH1_NODE = 4
+        XOR = 5
+        HASH_TMP = 6
+        HASH_COMB = 7
+        STEP_AND = 8
+        STEP_SELECT = 9
+        IDX_MAD = 10
+        MASK_LT = 11
+        IDX_SELECT = 12
+        STORE_OUT = 13
+        DONE = 14
 
-        state = [LOAD for _ in range(n_groups)]
+        period = forest_height + 1
+        state = [ROOT_XOR for _ in range(n_groups)]
         g_round = [0 for _ in range(n_groups)]
         ready = [0 for _ in range(n_groups)]
         hash_stage = [0 for _ in range(n_groups)]
 
         from collections import deque
 
-        load_queue = deque(range(n_groups))
+        load_queue: deque[int] = deque()
         store_queue: deque[int] = deque()
 
         load_group: int | None = None
@@ -449,7 +467,7 @@ class KernelBuilder:
                 if g is not None:
                     idx_base = idx_cache + g * VLEN
                     val_base = val_cache + g * VLEN
-                    t1 = tmp_hash1_arr + g * VLEN
+                    t1 = node_cache + g * VLEN
                     t2 = tmp_hash2_arr + g * VLEN
                     op2 = HASH_STAGES[hash_stage[g]][2]
                     instr_valu.append((op2, val_base, t1, t2))
@@ -466,7 +484,7 @@ class KernelBuilder:
                     g = find_ready(HASH_TMP)
                     if g is not None:
                         val_base = val_cache + g * VLEN
-                        t1 = tmp_hash1_arr + g * VLEN
+                        t1 = node_cache + g * VLEN
                         t2 = tmp_hash2_arr + g * VLEN
                         op1, val1, _op2, op3, val3 = HASH_STAGES[hash_stage[g]]
                         instr_valu.append((op1, t1, val_base, vec_const_map[val1]))
@@ -477,7 +495,15 @@ class KernelBuilder:
                         continue
 
                 scheduled = False
-                for st in (MASK_LT, IDX_MAD, STEP_AND, XOR):
+                for st in (
+                    MASK_LT,
+                    IDX_MAD,
+                    STEP_AND,
+                    XOR,
+                    DEPTH1_NODE,
+                    DEPTH1_MASK,
+                    ROOT_XOR,
+                ):
                     g = find_ready(st)
                     if g is None:
                         continue
@@ -485,13 +511,27 @@ class KernelBuilder:
                     idx_base = idx_cache + g * VLEN
                     val_base = val_cache + g * VLEN
                     node_base = node_cache + g * VLEN
-                    t1 = tmp_hash1_arr + g * VLEN
+                    t1 = node_base
                     t2 = tmp_hash2_arr + g * VLEN
 
                     if st == XOR:
                         instr_valu.append(("^", val_base, val_base, node_base))
                         hash_stage[g] = 0
                         state[g] = HASH_TMP
+                        ready[g] = cycle + 1
+                    elif st == ROOT_XOR:
+                        instr_valu.append(("^", val_base, val_base, node0_vec))
+                        hash_stage[g] = 0
+                        state[g] = HASH_TMP
+                        ready[g] = cycle + 1
+                    elif st == DEPTH1_MASK:
+                        # idx is guaranteed in {1,2}; mask = idx&1.
+                        instr_valu.append(("&", t2, idx_base, one_vec))
+                        state[g] = DEPTH1_NODE
+                        ready[g] = cycle + 1
+                    elif st == DEPTH1_NODE:
+                        instr_valu.append(("multiply_add", node_base, t2, node1_minus_node2_vec, node2_vec))
+                        state[g] = XOR
                         ready[g] = cycle + 1
                     elif st == STEP_AND:
                         instr_valu.append(("&", t1, val_base, one_vec))
@@ -524,11 +564,18 @@ class KernelBuilder:
                     idx_base = idx_cache + g_flow * VLEN
                     t2 = tmp_hash2_arr + g_flow * VLEN
                     instr_flow.append(("vselect", idx_base, t2, idx_base, zero_vec))
-                    g_round[g_flow] += 1
-                    if g_round[g_flow] < rounds:
-                        state[g_flow] = LOAD
+                    next_round = g_round[g_flow] + 1
+                    g_round[g_flow] = next_round
+                    if next_round < rounds:
+                        depth = next_round % period
+                        if depth == 0:
+                            state[g_flow] = ROOT_XOR
+                        elif depth == 1:
+                            state[g_flow] = DEPTH1_MASK
+                        else:
+                            state[g_flow] = LOAD
+                            load_queue.append(g_flow)
                         ready[g_flow] = cycle + 1
-                        load_queue.append(g_flow)
                     else:
                         state[g_flow] = STORE_OUT
                         ready[g_flow] = cycle + 1
@@ -536,7 +583,7 @@ class KernelBuilder:
                 else:
                     g_flow = find_ready(STEP_SELECT)
                     if g_flow is not None:
-                        t1 = tmp_hash1_arr + g_flow * VLEN
+                        t1 = node_cache + g_flow * VLEN
                         instr_flow.append(("vselect", t1, t1, two_vec, one_vec))
                         state[g_flow] = IDX_MAD
                         ready[g_flow] = cycle + 1
