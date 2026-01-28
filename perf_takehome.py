@@ -403,8 +403,7 @@ class KernelBuilder:
         STEP_AND = 8
         STEP_SELECT = 9
         IDX_MAD = 10
-        MASK_LT = 11
-        IDX_SELECT = 12
+        IDX_RESET = 11
         STORE_OUT = 13
         DONE = 14
         HASH_FUSED = 15
@@ -537,7 +536,14 @@ class KernelBuilder:
                             HASH_FUSED if next_stage in fused_mul_vec_by_stage else HASH_TMP
                         )
                     else:
-                        state[g] = STEP_AND
+                        next_round = g_round[g] + 1
+                        if next_round >= rounds:
+                            state[g] = STORE_OUT
+                            store_queue.append(g)
+                        elif next_round % period == 0:
+                            state[g] = IDX_RESET
+                        else:
+                            state[g] = STEP_AND
                     ready[g] = cycle + 1
                     valu_budget -= 1
                     continue
@@ -558,7 +564,14 @@ class KernelBuilder:
                             HASH_FUSED if next_stage in fused_mul_vec_by_stage else HASH_TMP
                         )
                     else:
-                        state[g] = STEP_AND
+                        next_round = g_round[g] + 1
+                        if next_round >= rounds:
+                            state[g] = STORE_OUT
+                            store_queue.append(g)
+                        elif next_round % period == 0:
+                            state[g] = IDX_RESET
+                        else:
+                            state[g] = STEP_AND
                     ready[g] = cycle + 1
                     valu_budget -= 1
                     continue
@@ -579,7 +592,6 @@ class KernelBuilder:
 
                 scheduled = False
                 for st in (
-                    MASK_LT,
                     IDX_MAD,
                     STEP_AND,
                     XOR,
@@ -679,12 +691,24 @@ class KernelBuilder:
                         ready[g] = cycle + 1
                     elif st == IDX_MAD:
                         instr_valu.append(("multiply_add", idx_base, idx_base, two_vec, t1))
-                        state[g] = MASK_LT
-                        ready[g] = cycle + 1
-                    elif st == MASK_LT:
-                        instr_valu.append(("<", t2, idx_base, n_nodes_vec))
-                        state[g] = IDX_SELECT
-                        ready[g] = cycle + 1
+                        next_round = g_round[g] + 1
+                        g_round[g] = next_round
+                        if next_round < rounds:
+                            depth = next_round % period
+                            if depth == 0:
+                                state[g] = ROOT_XOR
+                            elif depth == 1:
+                                state[g] = DEPTH1_MASK
+                            elif depth == 2:
+                                state[g] = DEPTH2_INIT
+                            else:
+                                state[g] = LOAD
+                                load_queue.append(g)
+                            ready[g] = cycle + 1
+                        else:
+                            state[g] = STORE_OUT
+                            ready[g] = cycle + 1
+                            store_queue.append(g)
                     else:
                         raise AssertionError("unreachable")
 
@@ -699,24 +723,14 @@ class KernelBuilder:
             # flow engine: use vselect to offload simple vector ops from valu.
             flow_budget = SLOT_LIMITS["flow"]
             if flow_budget > 0:
-                g_flow = find_ready(IDX_SELECT)
+                g_flow = find_ready(IDX_RESET)
                 if g_flow is not None:
                     idx_base = idx_cache + g_flow * VLEN
-                    t2 = tmp_hash2_arr + g_flow * VLEN
-                    instr_flow.append(("vselect", idx_base, t2, idx_base, zero_vec))
+                    instr_flow.append(("vselect", idx_base, one_vec, zero_vec, zero_vec))
                     next_round = g_round[g_flow] + 1
                     g_round[g_flow] = next_round
                     if next_round < rounds:
-                        depth = next_round % period
-                        if depth == 0:
-                            state[g_flow] = ROOT_XOR
-                        elif depth == 1:
-                            state[g_flow] = DEPTH1_MASK
-                        elif depth == 2:
-                            state[g_flow] = DEPTH2_INIT
-                        else:
-                            state[g_flow] = LOAD
-                            load_queue.append(g_flow)
+                        state[g_flow] = ROOT_XOR
                         ready[g_flow] = cycle + 1
                     else:
                         state[g_flow] = STORE_OUT
