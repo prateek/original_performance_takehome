@@ -16,7 +16,6 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
 import random
 import unittest
 
@@ -48,11 +47,132 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
+    def _slot_scratch_io(self, engine: str, slot: tuple) -> tuple[set[int], set[int]]:
+        reads: set[int] = set()
+        writes: set[int] = set()
+
+        def add_vec(base: int, length: int = VLEN, *, out: set[int]):
+            for i in range(length):
+                out.add(base + i)
+
+        match engine:
+            case "alu":
+                _, dest, a1, a2 = slot
+                reads.update((a1, a2))
+                writes.add(dest)
+            case "valu":
+                match slot:
+                    case ("vbroadcast", dest, src):
+                        reads.add(src)
+                        add_vec(dest, out=writes)
+                    case ("multiply_add", dest, a, b, c):
+                        add_vec(a, out=reads)
+                        add_vec(b, out=reads)
+                        add_vec(c, out=reads)
+                        add_vec(dest, out=writes)
+                    case (_, dest, a1, a2):
+                        add_vec(a1, out=reads)
+                        add_vec(a2, out=reads)
+                        add_vec(dest, out=writes)
+            case "load":
+                match slot:
+                    case ("const", dest, _val):
+                        writes.add(dest)
+                    case ("load", dest, addr):
+                        reads.add(addr)
+                        writes.add(dest)
+                    case ("load_offset", dest, addr, offset):
+                        reads.add(addr + offset)
+                        writes.add(dest + offset)
+                    case ("vload", dest, addr):
+                        reads.add(addr)
+                        add_vec(dest, out=writes)
+            case "store":
+                match slot:
+                    case ("store", addr, src):
+                        reads.update((addr, src))
+                    case ("vstore", addr, src):
+                        reads.add(addr)
+                        add_vec(src, out=reads)
+            case "flow":
+                match slot:
+                    case ("select", dest, cond, a, b):
+                        reads.update((cond, a, b))
+                        writes.add(dest)
+                    case ("add_imm", dest, a, _imm):
+                        reads.add(a)
+                        writes.add(dest)
+                    case ("vselect", dest, cond, a, b):
+                        add_vec(cond, out=reads)
+                        add_vec(a, out=reads)
+                        add_vec(b, out=reads)
+                        add_vec(dest, out=writes)
+                    case ("jump_indirect", addr):
+                        reads.add(addr)
+                    case ("cond_jump", cond, _addr):
+                        reads.add(cond)
+                    case ("cond_jump_rel", cond, _offset):
+                        reads.add(cond)
+                    case ("trace_write", val):
+                        reads.add(val)
+                    case ("coreid", dest):
+                        writes.add(dest)
+            case "debug":
+                match slot:
+                    case ("compare", loc, _key):
+                        reads.add(loc)
+                    case ("vcompare", loc, _keys):
+                        add_vec(loc, out=reads)
+            case _:
+                pass
+
+        return reads, writes
+
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
+        if not vliw:
+            # Simple slot packing that just uses one slot per instruction bundle
+            return [{engine: [slot]} for engine, slot in slots]
+
+        instrs: list[dict[str, list[tuple]]] = []
+        cur: dict[str, list[tuple]] = {}
+        written: set[int] = set()
+
+        def flush():
+            nonlocal cur, written
+            if cur:
+                instrs.append(cur)
+                cur = {}
+                written = set()
+
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            engine = str(engine)
+            if engine == "debug":
+                continue
+            reads, writes = self._slot_scratch_io(engine, slot)
+
+            limit = SLOT_LIMITS.get(engine, 1)
+            cur_engine_slots = cur.get(engine)
+            cur_engine_len = len(cur_engine_slots) if cur_engine_slots is not None else 0
+            if cur and (
+                cur_engine_len >= limit or (reads & written) or (writes & written)
+            ):
+                flush()
+
+            cur.setdefault(engine, []).append(slot)
+            written.update(writes)
+
+            is_barrier = engine == "flow" and slot and slot[0] in {
+                "pause",
+                "halt",
+                "jump",
+                "jump_indirect",
+                "cond_jump",
+                "cond_jump_rel",
+            }
+            if is_barrier:
+                flush()
+
+        flush()
         return instrs
 
     def add(self, engine, slot):
@@ -168,7 +288,7 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                 body.append(("store", ("store", tmp_addr, tmp_val)))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
