@@ -8,3 +8,4 @@
 2026-01-28: Pack prologue header loads (mem[0..6]) via VLIW load bundling; submission cycles now 2091.
 2026-01-28: Fuse hash stages 0/2/4 via `valu multiply_add` (e.g. `a + (a<<k) + C` → `a*(1+2^k) + C`); submission cycles now 1824.
 2026-01-28: Skip gather loads for depth 2 rounds (idx in {3,4,5,6}) via preloaded node3 + delta vectors and depth-aware scheduler states; submission cycles now 1672.
+2026-01-28: Move gather address prefetch to ALU (8 scalar adds) to free `valu` bandwidth; submission cycles now 1637.

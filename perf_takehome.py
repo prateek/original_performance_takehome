@@ -289,7 +289,6 @@ class KernelBuilder:
         mul33_vec = self.alloc_scratch("mul33_vec", VLEN)
         mul4097_vec = self.alloc_scratch("mul4097_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
-        forest_values_p_vec = self.alloc_scratch("forest_values_p_vec", VLEN)
         # Hot node constants for fast-path rounds (root + depth-1).
         node0_vec = self.alloc_scratch("node0_vec", VLEN)
         node2_vec = self.alloc_scratch("node2_vec", VLEN)
@@ -310,7 +309,6 @@ class KernelBuilder:
             ("valu", ("vbroadcast", mul33_vec, mul33_const)),
             ("valu", ("vbroadcast", mul4097_vec, mul4097_const)),
             ("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])),
-            ("valu", ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"])),
         ]
 
         # Vector constants used by the hash stages
@@ -445,6 +443,7 @@ class KernelBuilder:
 
         done_count = 0
         while done_count < n_groups:
+            instr_alu: list[tuple] = []
             instr_valu: list[tuple] = []
             instr_load: list[tuple] = []
             instr_store: list[tuple] = []
@@ -492,21 +491,27 @@ class KernelBuilder:
                         break
                     load_queue.append(load_queue.popleft())
 
-                if g_pref is not None and valu_budget > 0:
+                if g_pref is not None:
                     if load_buf_idx is not None:
                         buf_idx = 1 - load_buf_idx
                     else:
                         buf_idx = buf_toggle
                         buf_toggle = 1 - buf_toggle
                     idx_base = idx_cache + g_pref * VLEN
-                    instr_valu.append(
-                        ("+", addr_bufs[buf_idx], forest_values_p_vec, idx_base)
-                    )
+                    forest_values_p = self.scratch["forest_values_p"]
+                    for vi in range(VLEN):
+                        instr_alu.append(
+                            (
+                                "+",
+                                addr_bufs[buf_idx] + vi,
+                                forest_values_p,
+                                idx_base + vi,
+                            )
+                        )
                     prefetch_group = g_pref
                     prefetch_buf_idx = buf_idx
                     prefetch_ready = cycle + 1
                     state[g_pref] = PREFETCHED
-                    valu_budget -= 1
 
             def find_ready(target_state: int):
                 nonlocal rr_ptr
@@ -748,6 +753,8 @@ class KernelBuilder:
                     done_count += 1
 
             instr: dict[str, list[tuple]] = {}
+            if instr_alu:
+                instr["alu"] = instr_alu
             if instr_valu:
                 instr["valu"] = instr_valu
             if instr_load:
