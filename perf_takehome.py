@@ -275,10 +275,17 @@ class KernelBuilder:
         stride_const = scratch_const_packed(VLEN)
         mul33_const = scratch_const_packed(33)
         mul4097_const = scratch_const_packed(4097)
+        three_const = scratch_const_packed(3)
+        four_const = scratch_const_packed(4)
+        five_const = scratch_const_packed(5)
+        six_const = scratch_const_packed(6)
 
         one_vec = self.alloc_scratch("one_vec", VLEN)
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
         two_vec = self.alloc_scratch("two_vec", VLEN)
+        idx4_vec = self.alloc_scratch("idx4_vec", VLEN)
+        idx5_vec = self.alloc_scratch("idx5_vec", VLEN)
+        idx6_vec = self.alloc_scratch("idx6_vec", VLEN)
         mul33_vec = self.alloc_scratch("mul33_vec", VLEN)
         mul4097_vec = self.alloc_scratch("mul4097_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
@@ -287,10 +294,19 @@ class KernelBuilder:
         node0_vec = self.alloc_scratch("node0_vec", VLEN)
         node2_vec = self.alloc_scratch("node2_vec", VLEN)
         node1_minus_node2_vec = self.alloc_scratch("node1_minus_node2_vec", VLEN)
+        # Depth-2 fast-path (idx in {3,4,5,6}): materialize node3 and keep
+        # node{4,5,6}-node3 deltas for masked adds.
+        node3_vec = self.alloc_scratch("node3_vec", VLEN)
+        node4_minus_node3_vec = self.alloc_scratch("node4_minus_node3_vec", VLEN)
+        node5_minus_node3_vec = self.alloc_scratch("node5_minus_node3_vec", VLEN)
+        node6_minus_node3_vec = self.alloc_scratch("node6_minus_node3_vec", VLEN)
 
         vector_slots: list[tuple[Engine, tuple]] = [
             ("valu", ("vbroadcast", one_vec, one_const)),
             ("valu", ("vbroadcast", two_vec, two_const)),
+            ("valu", ("vbroadcast", idx4_vec, four_const)),
+            ("valu", ("vbroadcast", idx5_vec, five_const)),
+            ("valu", ("vbroadcast", idx6_vec, six_const)),
             ("valu", ("vbroadcast", mul33_vec, mul33_const)),
             ("valu", ("vbroadcast", mul4097_vec, mul4097_const)),
             ("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])),
@@ -338,6 +354,23 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", node2_vec, tmp3)))
         body.append(("valu", ("vbroadcast", node1_minus_node2_vec, tmp2)))
         body.append(("valu", ("-", node1_minus_node2_vec, node1_minus_node2_vec, node2_vec)))
+        # Depth-2 fast path (idx in {3,4,5,6}): load nodes once and compute
+        # node{4,5,6}-node3 deltas for masked adds.
+        body.append(("alu", ("+", tmp1, self.scratch["forest_values_p"], three_const)))
+        body.append(("load", ("load", tmp1, tmp1)))
+        body.append(("valu", ("vbroadcast", node3_vec, tmp1)))
+        body.append(("alu", ("+", tmp1, self.scratch["forest_values_p"], four_const)))
+        body.append(("load", ("load", tmp1, tmp1)))
+        body.append(("valu", ("vbroadcast", node4_minus_node3_vec, tmp1)))
+        body.append(("alu", ("+", tmp1, self.scratch["forest_values_p"], five_const)))
+        body.append(("load", ("load", tmp1, tmp1)))
+        body.append(("valu", ("vbroadcast", node5_minus_node3_vec, tmp1)))
+        body.append(("alu", ("+", tmp1, self.scratch["forest_values_p"], six_const)))
+        body.append(("load", ("load", tmp1, tmp1)))
+        body.append(("valu", ("vbroadcast", node6_minus_node3_vec, tmp1)))
+        body.append(("valu", ("-", node4_minus_node3_vec, node4_minus_node3_vec, node3_vec)))
+        body.append(("valu", ("-", node5_minus_node3_vec, node5_minus_node3_vec, node3_vec)))
+        body.append(("valu", ("-", node6_minus_node3_vec, node6_minus_node3_vec, node3_vec)))
         body.append(("alu", ("+", idx_ptrs + 0, self.scratch["inp_indices_p"], zero_const)))
         body.append(("alu", ("+", val_ptrs + 0, self.scratch["inp_values_p"], zero_const)))
         for g in range(1, n_groups):
@@ -377,6 +410,10 @@ class KernelBuilder:
         STORE_OUT = 13
         DONE = 14
         HASH_FUSED = 15
+        DEPTH2_INIT = 16
+        DEPTH2_ADD4 = 17
+        DEPTH2_ADD5 = 18
+        DEPTH2_ADD6 = 19
 
         period = forest_height + 1
         state = [ROOT_XOR for _ in range(n_groups)]
@@ -541,6 +578,10 @@ class KernelBuilder:
                     IDX_MAD,
                     STEP_AND,
                     XOR,
+                    DEPTH2_ADD6,
+                    DEPTH2_ADD5,
+                    DEPTH2_ADD4,
+                    DEPTH2_INIT,
                     DEPTH1_NODE,
                     DEPTH1_MASK,
                     ROOT_XOR,
@@ -555,6 +596,7 @@ class KernelBuilder:
                     t1 = node_base
                     t2 = tmp_hash2_arr + g * VLEN
 
+                    consumed = 1
                     if st == XOR:
                         instr_valu.append(("^", val_base, val_base, node_base))
                         hash_stage[g] = 0
@@ -564,6 +606,58 @@ class KernelBuilder:
                         instr_valu.append(("^", val_base, val_base, node0_vec))
                         hash_stage[g] = 0
                         state[g] = HASH_FUSED if 0 in fused_mul_vec_by_stage else HASH_TMP
+                        ready[g] = cycle + 1
+                    elif st == DEPTH2_INIT:
+                        if valu_budget < 2:
+                            continue
+                        instr_valu.append(("+", node_base, node3_vec, zero_vec))
+                        instr_valu.append(("==", t2, idx_base, idx4_vec))
+                        state[g] = DEPTH2_ADD4
+                        ready[g] = cycle + 1
+                        consumed = 2
+                    elif st == DEPTH2_ADD4:
+                        if valu_budget < 2:
+                            continue
+                        instr_valu.append(
+                            (
+                                "multiply_add",
+                                node_base,
+                                t2,
+                                node4_minus_node3_vec,
+                                node_base,
+                            )
+                        )
+                        instr_valu.append(("==", t2, idx_base, idx5_vec))
+                        state[g] = DEPTH2_ADD5
+                        ready[g] = cycle + 1
+                        consumed = 2
+                    elif st == DEPTH2_ADD5:
+                        if valu_budget < 2:
+                            continue
+                        instr_valu.append(
+                            (
+                                "multiply_add",
+                                node_base,
+                                t2,
+                                node5_minus_node3_vec,
+                                node_base,
+                            )
+                        )
+                        instr_valu.append(("==", t2, idx_base, idx6_vec))
+                        state[g] = DEPTH2_ADD6
+                        ready[g] = cycle + 1
+                        consumed = 2
+                    elif st == DEPTH2_ADD6:
+                        instr_valu.append(
+                            (
+                                "multiply_add",
+                                node_base,
+                                t2,
+                                node6_minus_node3_vec,
+                                node_base,
+                            )
+                        )
+                        state[g] = XOR
                         ready[g] = cycle + 1
                     elif st == DEPTH1_MASK:
                         # idx is guaranteed in {1,2}; mask = idx&1.
@@ -589,7 +683,7 @@ class KernelBuilder:
                     else:
                         raise AssertionError("unreachable")
 
-                    valu_budget -= 1
+                    valu_budget -= consumed
                     scheduled = True
                     break
 
@@ -613,6 +707,8 @@ class KernelBuilder:
                             state[g_flow] = ROOT_XOR
                         elif depth == 1:
                             state[g_flow] = DEPTH1_MASK
+                        elif depth == 2:
+                            state[g_flow] = DEPTH2_INIT
                         else:
                             state[g_flow] = LOAD
                             load_queue.append(g_flow)
