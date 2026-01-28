@@ -469,9 +469,6 @@ class KernelBuilder:
             4: vec_const_map[9],
         }
 
-        self.instrs.extend(self.build(const_slots, vliw=True))
-        self.instrs.extend(self.build(vector_slots, vliw=True))
-
         # Precompute contiguous vload/vstore base addresses (reused across all rounds)
         n_groups = batch_size // VLEN
         val_ptrs = self.alloc_scratch("val_ptrs", n_groups)
@@ -542,9 +539,10 @@ class KernelBuilder:
                 body.append(("alu", ("+", ptr2, ptr2, stride_const)))
                 body.append(("alu", ("+", ptr3, ptr3, stride_const)))
 
-        # Pack the setup/caching phase with the generic VLIW packer.
-        body_instrs = self.build(body, vliw=True)
-        self.instrs.extend(body_instrs)
+        # Pack constants, broadcasts, and the setup/caching phase together so
+        # independent load/alu/valu work can overlap in fewer bundles.
+        setup_instrs = self.build(const_slots + vector_slots + body, vliw=True)
+        self.instrs.extend(setup_instrs)
 
         # Main loop: software-pipelined, group-interleaved schedule.
         #
