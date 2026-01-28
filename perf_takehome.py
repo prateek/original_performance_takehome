@@ -205,6 +205,16 @@ class KernelBuilder:
 
         return slots
 
+    def build_hash_vec(self, val_hash_addr, tmp1, tmp2, vec_const_map):
+        slots = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            slots.append(("valu", (op1, tmp1, val_hash_addr, vec_const_map[val1])))
+            slots.append(("valu", (op3, tmp2, val_hash_addr, vec_const_map[val3])))
+            slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+
+        return slots
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
@@ -231,9 +241,7 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -245,48 +253,92 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        if batch_size % VLEN != 0:
+            raise ValueError(f"{batch_size=} must be a multiple of {VLEN=}")
+
+        # Vector scratch registers
+        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
+        tmp_val = self.alloc_scratch("tmp_val", VLEN)
+        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
+        tmp_addr = self.alloc_scratch("tmp_addr", VLEN)
+        tmp_idx_dbl = self.alloc_scratch("tmp_idx_dbl", VLEN)
+        tmp_hash1 = self.alloc_scratch("tmp_hash1", VLEN)
+        tmp_hash2 = self.alloc_scratch("tmp_hash2", VLEN)
+        tmp_step = self.alloc_scratch("tmp_step", VLEN)
+        tmp_mask = self.alloc_scratch("tmp_mask", VLEN)
+
+        # Vector constants and scalars broadcasted to vectors
+        one_vec = self.alloc_scratch("one_vec", VLEN)
+        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
+        forest_values_p_vec = self.alloc_scratch("forest_values_p_vec", VLEN)
+
+        self.add("valu", ("vbroadcast", one_vec, one_const))
+        self.add("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"]))
+        self.add(
+            "valu",
+            ("vbroadcast", forest_values_p_vec, self.scratch["forest_values_p"]),
+        )
+
+        # Vector constants used by the hash stages
+        vec_const_map = {}
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            for v in (val1, val3):
+                if v in vec_const_map:
+                    continue
+                v_scalar = self.scratch_const(v)
+                v_vec = self.alloc_scratch(f"const_{v:x}_vec", VLEN)
+                self.add("valu", ("vbroadcast", v_vec, v_scalar))
+                vec_const_map[v] = v_vec
+
+        # Precompute contiguous vload/vstore base addresses (reused across all rounds)
+        n_groups = batch_size // VLEN
+        idx_ptrs = self.alloc_scratch("idx_ptrs", n_groups)
+        val_ptrs = self.alloc_scratch("val_ptrs", n_groups)
+        for g in range(n_groups):
+            off_const = self.scratch_const(g * VLEN)
+            body.append(
+                ("alu", ("+", idx_ptrs + g, self.scratch["inp_indices_p"], off_const))
+            )
+            body.append(
+                ("alu", ("+", val_ptrs + g, self.scratch["inp_values_p"], off_const))
+            )
 
         for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+            for g in range(n_groups):
+                idx_ptr = idx_ptrs + g
+                val_ptr = val_ptrs + g
+
+                # idx = mem[inp_indices_p + i : i+VLEN]
+                body.append(("load", ("vload", tmp_idx, idx_ptr)))
+                # val = mem[inp_values_p + i : i+VLEN]
+                body.append(("load", ("vload", tmp_val, val_ptr)))
+
+                # tmp_addr[v] = forest_values_p + idx[v]
+                body.append(("valu", ("+", tmp_addr, forest_values_p_vec, tmp_idx)))
+                # tmp_idx_dbl[v] = 2 * idx[v]
+                body.append(("valu", ("+", tmp_idx_dbl, tmp_idx, tmp_idx)))
+
+                # node_val[v] = mem[forest_values_p + idx[v]] (gather)
+                for off in range(VLEN):
+                    body.append(("load", ("load_offset", tmp_node_val, tmp_addr, off)))
+
                 # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                body.append(("valu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                body.extend(self.build_hash_vec(tmp_val, tmp_hash1, tmp_hash2, vec_const_map))
+
+                # idx = 2*idx + (1 + (val & 1))
+                body.append(("valu", ("&", tmp_step, tmp_val, one_vec)))
+                body.append(("valu", ("+", tmp_step, tmp_step, one_vec)))
+                body.append(("valu", ("+", tmp_idx, tmp_idx_dbl, tmp_step)))
+
+                # idx = idx if idx < n_nodes else 0  (masking avoids flow bottleneck)
+                body.append(("valu", ("<", tmp_mask, tmp_idx, n_nodes_vec)))
+                body.append(("valu", ("*", tmp_idx, tmp_idx, tmp_mask)))
+
+                # mem[inp_indices_p + i : i+VLEN] = idx
+                body.append(("store", ("vstore", idx_ptr, tmp_idx)))
+                # mem[inp_values_p + i : i+VLEN] = val
+                body.append(("store", ("vstore", val_ptr, tmp_val)))
 
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
