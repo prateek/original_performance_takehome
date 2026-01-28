@@ -13,3 +13,4 @@
 2026-01-28: Keep indices entirely in scratch (inputs start at 0): remove `idx_ptrs` + index vload/vstore; trim unused header loads; fold pause into existing bundles; submission cycles now 1547.
 2026-01-28: Overlap gather-round XOR into scalar ALU (lane-wise `val ^= node`), reducing `valu` pressure; submission cycles now 1538.
 2026-01-28: Re-ran authoritative submission tests; submission cycles still 1538.
+2026-01-28: Vectorize prologue forest node preload (single `vload` for nodes[0..7] + broadcasts for depth 0–2 fast paths); submission cycles now 1529.
