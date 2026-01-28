@@ -237,9 +237,13 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+        hdr_idxs = self.alloc_scratch("hdr_idxs", len(init_vars))
+        prologue_slots: list[tuple[Engine, tuple]] = []
+        for i in range(len(init_vars)):
+            prologue_slots.append(("load", ("const", hdr_idxs + i, i)))
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            prologue_slots.append(("load", ("load", self.scratch[v], hdr_idxs + i)))
+        self.instrs.extend(self.build(prologue_slots, vliw=True))
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
