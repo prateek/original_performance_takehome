@@ -11,3 +11,4 @@
 2026-01-28: Move gather address prefetch to ALU (8 scalar adds) to free `valu` bandwidth; submission cycles now 1637.
 2026-01-28: Remove per-round idx bounds-check/clamp (only wrap at depth boundary) via `IDX_RESET` flow state; skip idx update on final round; submission cycles now 1570.
 2026-01-28: Keep indices entirely in scratch (inputs start at 0): remove `idx_ptrs` + index vload/vstore; trim unused header loads; fold pause into existing bundles; submission cycles now 1547.
+2026-01-28: Overlap gather-round XOR into scalar ALU (lane-wise `val ^= node`), reducing `valu` pressure; submission cycles now 1538.

@@ -402,21 +402,25 @@ class KernelBuilder:
         DEPTH2_ADD4 = 17
         DEPTH2_ADD5 = 18
         DEPTH2_ADD6 = 19
+        POSTLOAD_XOR = 20
 
         period = forest_height + 1
         state = [ROOT_XOR for _ in range(n_groups)]
         g_round = [0 for _ in range(n_groups)]
         ready = [0 for _ in range(n_groups)]
         hash_stage = [0 for _ in range(n_groups)]
+        postload_xor_off = [0 for _ in range(n_groups)]
 
         from collections import deque
 
         load_queue: deque[int] = deque()
         store_queue: deque[int] = deque()
+        xor_queue: deque[int] = deque()
 
         load_group: int | None = None
         load_buf_idx: int | None = None
         load_off = 0
+        load_xor_off = 0
 
         prefetch_group: int | None = None
         prefetch_buf_idx: int | None = None
@@ -448,26 +452,23 @@ class KernelBuilder:
                 load_group = prefetch_group
                 load_buf_idx = prefetch_buf_idx
                 load_off = 0
+                load_xor_off = 0
                 prefetch_group = None
                 prefetch_buf_idx = None
 
             # Load engine: 2 scalar gathers per cycle for the active load_group.
+            load_off_start: int | None = None
             if load_group is not None and load_buf_idx is not None:
                 g = load_group
                 addr_buf = addr_bufs[load_buf_idx]
                 node_base = node_cache + g * VLEN
+                load_off_start = load_off
                 for _ in range(SLOT_LIMITS["load"]):
                     if load_off < VLEN:
                         instr_load.append(
                             ("load_offset", node_base, addr_buf, load_off)
                         )
                         load_off += 1
-                if load_off >= VLEN:
-                    # node_cache is written at end of this cycle; XOR can start next cycle.
-                    state[g] = XOR
-                    ready[g] = cycle + 1
-                    load_group = None
-                    load_buf_idx = None
 
             # valu engine: keep load pipeline primed by prefetching next group's addresses.
             valu_budget = SLOT_LIMITS["valu"]
@@ -502,6 +503,63 @@ class KernelBuilder:
                     prefetch_buf_idx = buf_idx
                     prefetch_ready = cycle + 1
                     state[g_pref] = PREFETCHED
+
+            # ALU engine: overlap lane-wise XOR with gather loads to save valu bandwidth.
+            alu_budget = SLOT_LIMITS["alu"] - len(instr_alu)
+            while alu_budget > 0 and xor_queue:
+                g_xor = xor_queue[0]
+                if ready[g_xor] > cycle:
+                    break
+
+                off = postload_xor_off[g_xor]
+                val_base = val_cache + g_xor * VLEN
+                node_base = node_cache + g_xor * VLEN
+                while alu_budget > 0 and off < VLEN:
+                    instr_alu.append(
+                        ("^", val_base + off, val_base + off, node_base + off)
+                    )
+                    off += 1
+                    alu_budget -= 1
+                postload_xor_off[g_xor] = off
+
+                if off < VLEN:
+                    break
+
+                xor_queue.popleft()
+                hash_stage[g_xor] = 0
+                state[g_xor] = HASH_FUSED if 0 in fused_mul_vec_by_stage else HASH_TMP
+                ready[g_xor] = cycle + 1
+
+            if (
+                alu_budget > 0
+                and load_group is not None
+                and load_buf_idx is not None
+                and load_off_start is not None
+            ):
+                g = load_group
+                val_base = val_cache + g * VLEN
+                node_base = node_cache + g * VLEN
+                while alu_budget > 0 and load_xor_off < load_off_start:
+                    instr_alu.append(
+                        (
+                            "^",
+                            val_base + load_xor_off,
+                            val_base + load_xor_off,
+                            node_base + load_xor_off,
+                        )
+                    )
+                    load_xor_off += 1
+                    alu_budget -= 1
+
+            if load_group is not None and load_buf_idx is not None and load_off >= VLEN:
+                # Remaining lanes were loaded this cycle; finish XOR next cycle.
+                g = load_group
+                state[g] = POSTLOAD_XOR
+                postload_xor_off[g] = load_xor_off
+                ready[g] = cycle + 1
+                xor_queue.append(g)
+                load_group = None
+                load_buf_idx = None
 
             def find_ready(target_state: int):
                 nonlocal rr_ptr
