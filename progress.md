@@ -17,3 +17,4 @@
 2026-01-28: Tried depth-3 fast path (preload nodes[7..14] + masked-add selection); regressed to 1636 cycles, reverted; best remains 1529.
 2026-01-28: Stagger per-group start times (ready offsets) to smooth pipeline fill/drain; submission cycles now 1483.
 2026-01-28: Preload `val_cache` + materialize `val_ptrs` with 4 independent pointer streams (blocks of 8 groups) to remove the 32-step scalar chain; retuned `start_spacing` to 14; submission cycles now 1418.
+2026-01-28: Upgrade VLIW slot packing in `KernelBuilder.build` to a dependency-aware list scheduler (RAW/WAW + WAR) to reorder independent slots for tighter bundling; submission cycles now 1414.

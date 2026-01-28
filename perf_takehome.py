@@ -133,35 +133,8 @@ class KernelBuilder:
             # Simple slot packing that just uses one slot per instruction bundle
             return [{engine: [slot]} for engine, slot in slots]
 
-        instrs: list[dict[str, list[tuple]]] = []
-        cur: dict[str, list[tuple]] = {}
-        written: set[int] = set()
-
-        def flush():
-            nonlocal cur, written
-            if cur:
-                instrs.append(cur)
-                cur = {}
-                written = set()
-
-        for engine, slot in slots:
-            engine = str(engine)
-            if engine == "debug":
-                continue
-            reads, writes = self._slot_scratch_io(engine, slot)
-
-            limit = SLOT_LIMITS.get(engine, 1)
-            cur_engine_slots = cur.get(engine)
-            cur_engine_len = len(cur_engine_slots) if cur_engine_slots is not None else 0
-            if cur and (
-                cur_engine_len >= limit or (reads & written) or (writes & written)
-            ):
-                flush()
-
-            cur.setdefault(engine, []).append(slot)
-            written.update(writes)
-
-            is_barrier = engine == "flow" and slot and slot[0] in {
+        def is_barrier(engine: str, slot: tuple) -> bool:
+            return engine == "flow" and slot and slot[0] in {
                 "pause",
                 "halt",
                 "jump",
@@ -169,11 +142,184 @@ class KernelBuilder:
                 "cond_jump",
                 "cond_jump_rel",
             }
-            if is_barrier:
-                flush()
 
-        flush()
-        return instrs
+        def schedule_segment(segment: list[tuple[str, tuple]]) -> list[dict[str, list[tuple]]]:
+            if not segment:
+                return []
+
+            engines: list[str] = []
+            slots_only: list[tuple] = []
+            reads: list[set[int]] = []
+            writes: list[set[int]] = []
+            for engine, slot in segment:
+                engines.append(engine)
+                slots_only.append(slot)
+                r, w = self._slot_scratch_io(engine, slot)
+                reads.append(r)
+                writes.append(w)
+
+            n = len(segment)
+            succ0: list[set[int]] = [set() for _ in range(n)]
+            succ1: list[set[int]] = [set() for _ in range(n)]
+            pred0_count = [0 for _ in range(n)]
+            pred1_count = [0 for _ in range(n)]
+
+            def add_edge(pred: int, succ: int, latency: int) -> None:
+                if pred == succ:
+                    return
+                if latency == 0:
+                    if succ not in succ0[pred]:
+                        succ0[pred].add(succ)
+                        pred0_count[succ] += 1
+                else:
+                    if succ not in succ1[pred]:
+                        succ1[pred].add(succ)
+                        pred1_count[succ] += 1
+
+            last_write: dict[int, int] = {}
+            pending_reads: dict[int, list[int]] = {}
+
+            for i in range(n):
+                rset = reads[i]
+                wset = writes[i]
+
+                # True deps (RAW) and output deps (WAW) require a new cycle because
+                # writes are not visible until the end of the bundle.
+                for addr in rset:
+                    pred = last_write.get(addr)
+                    if pred is not None:
+                        add_edge(pred, i, 1)
+                for addr in wset:
+                    pred = last_write.get(addr)
+                    if pred is not None:
+                        add_edge(pred, i, 1)
+
+                # Anti-deps (WAR): a write may not move before any earlier read of
+                # the same location (but can share the same cycle).
+                for addr in wset:
+                    waiters = pending_reads.get(addr)
+                    if waiters:
+                        for pred in waiters:
+                            add_edge(pred, i, 0)
+                        pending_reads[addr] = []
+
+                for addr in wset:
+                    last_write[addr] = i
+
+                # Track reads that must remain before the next write to the same loc.
+                if wset:
+                    for addr in rset:
+                        if addr in wset:
+                            continue
+                        pending_reads.setdefault(addr, []).append(i)
+                else:
+                    for addr in rset:
+                        pending_reads.setdefault(addr, []).append(i)
+
+            ready: set[int] = {
+                i for i in range(n) if pred0_count[i] == 0 and pred1_count[i] == 0
+            }
+            scheduled = [False for _ in range(n)]
+            remaining = n
+            out: list[dict[str, list[tuple]]] = []
+            engine_order = ("load", "store", "flow", "valu", "alu")
+
+            while remaining:
+                cur: dict[str, list[tuple]] = {}
+                written: set[int] = set()
+                engine_counts: dict[str, int] = {}
+                scheduled_this_cycle: list[int] = []
+
+                made_progress = True
+                while made_progress:
+                    made_progress = False
+                    for engine in engine_order:
+                        limit = SLOT_LIMITS.get(engine, 1)
+                        while engine_counts.get(engine, 0) < limit:
+                            cand: int | None = None
+                            for i in ready:
+                                if engines[i] != engine:
+                                    continue
+                                if reads[i] & written:
+                                    continue
+                                if writes[i] & written:
+                                    continue
+                                if cand is None or i < cand:
+                                    cand = i
+
+                            if cand is None:
+                                break
+
+                            ready.remove(cand)
+                            scheduled[cand] = True
+                            remaining -= 1
+                            engine_counts[engine] = engine_counts.get(engine, 0) + 1
+                            cur.setdefault(engine, []).append(slots_only[cand])
+                            written.update(writes[cand])
+                            scheduled_this_cycle.append(cand)
+
+                            for succ in succ0[cand]:
+                                pred0_count[succ] -= 1
+                                if (
+                                    pred0_count[succ] == 0
+                                    and pred1_count[succ] == 0
+                                    and not scheduled[succ]
+                                ):
+                                    ready.add(succ)
+
+                            made_progress = True
+
+                if not cur:
+                    # If we couldn't pack anything (should be rare), emit the next
+                    # ready slot in its own bundle to break the deadlock.
+                    if not ready:
+                        raise RuntimeError("VLIW scheduler deadlocked (no ready slots)")
+                    cand = min(ready)
+                    engine = engines[cand]
+                    ready.remove(cand)
+                    scheduled[cand] = True
+                    remaining -= 1
+                    cur = {engine: [slots_only[cand]]}
+                    written.update(writes[cand])
+                    scheduled_this_cycle.append(cand)
+                    for succ in succ0[cand]:
+                        pred0_count[succ] -= 1
+                        if (
+                            pred0_count[succ] == 0
+                            and pred1_count[succ] == 0
+                            and not scheduled[succ]
+                        ):
+                            ready.add(succ)
+
+                out.append(cur)
+
+                for pred in scheduled_this_cycle:
+                    for succ in succ1[pred]:
+                        pred1_count[succ] -= 1
+                        if (
+                            pred0_count[succ] == 0
+                            and pred1_count[succ] == 0
+                            and not scheduled[succ]
+                        ):
+                            ready.add(succ)
+
+            return out
+
+        out: list[dict[str, list[tuple]]] = []
+        segment: list[tuple[str, tuple]] = []
+        for engine, slot in slots:
+            engine = str(engine)
+            if engine == "debug":
+                continue
+            if is_barrier(engine, slot):
+                out.extend(schedule_segment(segment))
+                segment = []
+                out.extend(schedule_segment([(engine, slot)]))
+            else:
+                segment.append((engine, slot))
+
+        out.extend(schedule_segment(segment))
+        return out
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
