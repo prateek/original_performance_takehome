@@ -14,3 +14,4 @@
 2026-01-28: Overlap gather-round XOR into scalar ALU (lane-wise `val ^= node`), reducing `valu` pressure; submission cycles now 1538.
 2026-01-28: Re-ran authoritative submission tests; submission cycles still 1538.
 2026-01-28: Vectorize prologue forest node preload (single `vload` for nodes[0..7] + broadcasts for depth 0–2 fast paths); submission cycles now 1529.
+2026-01-28: Tried depth-3 fast path (preload nodes[7..14] + masked-add selection); regressed to 1636 cycles, reverted; best remains 1529.
