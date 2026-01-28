@@ -256,23 +256,14 @@ class KernelBuilder:
         if batch_size % VLEN != 0:
             raise ValueError(f"{batch_size=} must be a multiple of {VLEN=}")
 
-        # Vector scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx", VLEN)
-        tmp_val = self.alloc_scratch("tmp_val", VLEN)
-        tmp_node_val = self.alloc_scratch("tmp_node_val", VLEN)
-        tmp_addr = self.alloc_scratch("tmp_addr", VLEN)
-        tmp_idx_dbl = self.alloc_scratch("tmp_idx_dbl", VLEN)
-        tmp_hash1 = self.alloc_scratch("tmp_hash1", VLEN)
-        tmp_hash2 = self.alloc_scratch("tmp_hash2", VLEN)
-        tmp_step = self.alloc_scratch("tmp_step", VLEN)
-        tmp_mask = self.alloc_scratch("tmp_mask", VLEN)
-
         # Vector constants and scalars broadcasted to vectors
         one_vec = self.alloc_scratch("one_vec", VLEN)
+        two_vec = self.alloc_scratch("two_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         forest_values_p_vec = self.alloc_scratch("forest_values_p_vec", VLEN)
 
         self.add("valu", ("vbroadcast", one_vec, one_const))
+        self.add("valu", ("vbroadcast", two_vec, self.scratch_const(2)))
         self.add("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"]))
         self.add(
             "valu",
@@ -296,56 +287,273 @@ class KernelBuilder:
         val_ptrs = self.alloc_scratch("val_ptrs", n_groups)
         idx_cache = self.alloc_scratch("idx_cache", batch_size)
         val_cache = self.alloc_scratch("val_cache", batch_size)
-        for g in range(n_groups):
-            off_const = self.scratch_const(g * VLEN)
-            body.append(
-                ("alu", ("+", idx_ptrs + g, self.scratch["inp_indices_p"], off_const))
-            )
-            body.append(
-                ("alu", ("+", val_ptrs + g, self.scratch["inp_values_p"], off_const))
-            )
+        node_cache = self.alloc_scratch("node_cache", batch_size)
+        tmp_hash1_arr = self.alloc_scratch("tmp_hash1_arr", batch_size)
+        tmp_hash2_arr = self.alloc_scratch("tmp_hash2_arr", batch_size)
+        addr_buf0 = self.alloc_scratch("addr_buf0", VLEN)
+        addr_buf1 = self.alloc_scratch("addr_buf1", VLEN)
+        zero_const = self.scratch_const(0)
+        stride_const = self.scratch_const(VLEN)
+        body.append(("alu", ("+", idx_ptrs + 0, self.scratch["inp_indices_p"], zero_const)))
+        body.append(("alu", ("+", val_ptrs + 0, self.scratch["inp_values_p"], zero_const)))
+        for g in range(1, n_groups):
+            body.append(("alu", ("+", idx_ptrs + g, idx_ptrs + g - 1, stride_const)))
+            body.append(("alu", ("+", val_ptrs + g, val_ptrs + g - 1, stride_const)))
 
         # Cache idx/val in scratch to avoid per-round vload/vstore traffic.
         for g in range(n_groups):
             body.append(("load", ("vload", idx_cache + g * VLEN, idx_ptrs + g)))
             body.append(("load", ("vload", val_cache + g * VLEN, val_ptrs + g)))
 
-        for round in range(rounds):
-            for g in range(n_groups):
-                idx_base = idx_cache + g * VLEN
-                val_base = val_cache + g * VLEN
-
-                # tmp_addr[v] = forest_values_p + idx[v]
-                body.append(("valu", ("+", tmp_addr, forest_values_p_vec, idx_base)))
-                # tmp_idx_dbl[v] = 2 * idx[v]
-                body.append(("valu", ("+", tmp_idx_dbl, idx_base, idx_base)))
-
-                # node_val[v] = mem[forest_values_p + idx[v]] (gather)
-                for off in range(VLEN):
-                    body.append(("load", ("load_offset", tmp_node_val, tmp_addr, off)))
-
-                # val = myhash(val ^ node_val)
-                body.append(("valu", ("^", val_base, val_base, tmp_node_val)))
-                body.extend(
-                    self.build_hash_vec(val_base, tmp_hash1, tmp_hash2, vec_const_map)
-                )
-
-                # idx = 2*idx + (1 + (val & 1))
-                body.append(("valu", ("&", tmp_step, val_base, one_vec)))
-                body.append(("valu", ("+", tmp_step, tmp_step, one_vec)))
-                body.append(("valu", ("+", idx_base, tmp_idx_dbl, tmp_step)))
-
-                # idx = idx if idx < n_nodes else 0  (masking avoids flow bottleneck)
-                body.append(("valu", ("<", tmp_mask, idx_base, n_nodes_vec)))
-                body.append(("valu", ("*", idx_base, idx_base, tmp_mask)))
-
-        # Write back cached idx/val once at the end.
-        for g in range(n_groups):
-            body.append(("store", ("vstore", idx_ptrs + g, idx_cache + g * VLEN)))
-            body.append(("store", ("vstore", val_ptrs + g, val_cache + g * VLEN)))
-
+        # Pack the setup/caching phase with the generic VLIW packer.
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
+
+        # Main loop: software-pipelined, group-interleaved schedule.
+        #
+        # We keep per-group idx/val in scratch (idx_cache/val_cache) and overlap:
+        # - load engine: scalar gathers into node_cache (2 loads/cycle)
+        # - valu engine: hash + idx update across multiple groups (6 valu slots/cycle)
+        addr_bufs = [addr_buf0, addr_buf1]
+
+        # Per-group state machine. Groups are independent, so we can interleave rounds.
+        LOAD = 0
+        PREFETCHED = 1
+        XOR = 2
+        HASH_TMP = 3
+        HASH_COMB = 4
+        STEP_AND = 5
+        STEP_ADD = 6
+        IDX_MAD = 7
+        MASK_LT = 8
+        IDX_MASK = 9
+        STORE_OUT = 10
+        DONE = 11
+
+        state = [LOAD for _ in range(n_groups)]
+        g_round = [0 for _ in range(n_groups)]
+        ready = [0 for _ in range(n_groups)]
+        hash_stage = [0 for _ in range(n_groups)]
+
+        from collections import deque
+
+        load_queue = deque(range(n_groups))
+        store_queue: deque[int] = deque()
+
+        load_group: int | None = None
+        load_buf_idx: int | None = None
+        load_off = 0
+
+        prefetch_group: int | None = None
+        prefetch_buf_idx: int | None = None
+        prefetch_ready = 0
+        buf_toggle = 0
+
+        rr_ptr = 0
+        cycle = 0
+        main_instrs: list[dict[str, list[tuple]]] = []
+
+        def group_iter(start: int):
+            for di in range(n_groups):
+                yield (start + di) % n_groups
+
+        done_count = 0
+        while done_count < n_groups:
+            instr_valu: list[tuple] = []
+            instr_load: list[tuple] = []
+            instr_store: list[tuple] = []
+
+            # Promote prefetched group to active loader when ready.
+            if (
+                load_group is None
+                and prefetch_group is not None
+                and cycle >= prefetch_ready
+            ):
+                load_group = prefetch_group
+                load_buf_idx = prefetch_buf_idx
+                load_off = 0
+                prefetch_group = None
+                prefetch_buf_idx = None
+
+            # Load engine: 2 scalar gathers per cycle for the active load_group.
+            if load_group is not None and load_buf_idx is not None:
+                g = load_group
+                addr_buf = addr_bufs[load_buf_idx]
+                node_base = node_cache + g * VLEN
+                for _ in range(SLOT_LIMITS["load"]):
+                    if load_off < VLEN:
+                        instr_load.append(
+                            ("load_offset", node_base, addr_buf, load_off)
+                        )
+                        load_off += 1
+                if load_off >= VLEN:
+                    # node_cache is written at end of this cycle; XOR can start next cycle.
+                    state[g] = XOR
+                    ready[g] = cycle + 1
+                    load_group = None
+                    load_buf_idx = None
+
+            # valu engine: keep load pipeline primed by prefetching next group's addresses.
+            valu_budget = SLOT_LIMITS["valu"]
+            if prefetch_group is None:
+                g_pref = None
+                for _ in range(len(load_queue)):
+                    cand = load_queue[0]
+                    if state[cand] == LOAD and ready[cand] <= cycle:
+                        g_pref = cand
+                        load_queue.popleft()
+                        break
+                    load_queue.append(load_queue.popleft())
+
+                if g_pref is not None and valu_budget > 0:
+                    if load_buf_idx is not None:
+                        buf_idx = 1 - load_buf_idx
+                    else:
+                        buf_idx = buf_toggle
+                        buf_toggle = 1 - buf_toggle
+                    idx_base = idx_cache + g_pref * VLEN
+                    instr_valu.append(
+                        ("+", addr_bufs[buf_idx], forest_values_p_vec, idx_base)
+                    )
+                    prefetch_group = g_pref
+                    prefetch_buf_idx = buf_idx
+                    prefetch_ready = cycle + 1
+                    state[g_pref] = PREFETCHED
+                    valu_budget -= 1
+
+            def find_ready(target_state: int):
+                nonlocal rr_ptr
+                for g in group_iter(rr_ptr):
+                    if state[g] == target_state and ready[g] <= cycle:
+                        rr_ptr = (g + 1) % n_groups
+                        return g
+                return None
+
+            while valu_budget > 0:
+                g = find_ready(HASH_COMB)
+                if g is not None:
+                    idx_base = idx_cache + g * VLEN
+                    val_base = val_cache + g * VLEN
+                    t1 = tmp_hash1_arr + g * VLEN
+                    t2 = tmp_hash2_arr + g * VLEN
+                    op2 = HASH_STAGES[hash_stage[g]][2]
+                    instr_valu.append((op2, val_base, t1, t2))
+                    if hash_stage[g] + 1 < len(HASH_STAGES):
+                        hash_stage[g] += 1
+                        state[g] = HASH_TMP
+                    else:
+                        state[g] = STEP_AND
+                    ready[g] = cycle + 1
+                    valu_budget -= 1
+                    continue
+
+                if valu_budget >= 2:
+                    g = find_ready(HASH_TMP)
+                    if g is not None:
+                        val_base = val_cache + g * VLEN
+                        t1 = tmp_hash1_arr + g * VLEN
+                        t2 = tmp_hash2_arr + g * VLEN
+                        op1, val1, _op2, op3, val3 = HASH_STAGES[hash_stage[g]]
+                        instr_valu.append((op1, t1, val_base, vec_const_map[val1]))
+                        instr_valu.append((op3, t2, val_base, vec_const_map[val3]))
+                        state[g] = HASH_COMB
+                        ready[g] = cycle + 1
+                        valu_budget -= 2
+                        continue
+
+                scheduled = False
+                for st in (IDX_MASK, MASK_LT, IDX_MAD, STEP_ADD, STEP_AND, XOR):
+                    g = find_ready(st)
+                    if g is None:
+                        continue
+
+                    idx_base = idx_cache + g * VLEN
+                    val_base = val_cache + g * VLEN
+                    node_base = node_cache + g * VLEN
+                    t1 = tmp_hash1_arr + g * VLEN
+                    t2 = tmp_hash2_arr + g * VLEN
+
+                    if st == XOR:
+                        instr_valu.append(("^", val_base, val_base, node_base))
+                        hash_stage[g] = 0
+                        state[g] = HASH_TMP
+                        ready[g] = cycle + 1
+                    elif st == STEP_AND:
+                        instr_valu.append(("&", t1, val_base, one_vec))
+                        state[g] = STEP_ADD
+                        ready[g] = cycle + 1
+                    elif st == STEP_ADD:
+                        instr_valu.append(("+", t1, t1, one_vec))
+                        state[g] = IDX_MAD
+                        ready[g] = cycle + 1
+                    elif st == IDX_MAD:
+                        instr_valu.append(("multiply_add", idx_base, idx_base, two_vec, t1))
+                        state[g] = MASK_LT
+                        ready[g] = cycle + 1
+                    elif st == MASK_LT:
+                        instr_valu.append(("<", t2, idx_base, n_nodes_vec))
+                        state[g] = IDX_MASK
+                        ready[g] = cycle + 1
+                    elif st == IDX_MASK:
+                        instr_valu.append(("*", idx_base, idx_base, t2))
+                        g_round[g] += 1
+                        if g_round[g] < rounds:
+                            state[g] = LOAD
+                            ready[g] = cycle + 1
+                            load_queue.append(g)
+                        else:
+                            state[g] = STORE_OUT
+                            ready[g] = cycle + 1
+                            store_queue.append(g)
+                    else:
+                        raise AssertionError("unreachable")
+
+                    valu_budget -= 1
+                    scheduled = True
+                    break
+
+                if scheduled:
+                    continue
+                break
+
+            # store engine: once a group completes all rounds, write it back (1 group/cycle).
+            store_budget = SLOT_LIMITS["store"]
+            if store_budget >= 2:
+                g_store = None
+                for _ in range(len(store_queue)):
+                    cand = store_queue[0]
+                    if state[cand] == STORE_OUT and ready[cand] <= cycle:
+                        g_store = cand
+                        store_queue.popleft()
+                        break
+                    store_queue.append(store_queue.popleft())
+
+                if g_store is not None:
+                    instr_store.append(
+                        ("vstore", idx_ptrs + g_store, idx_cache + g_store * VLEN)
+                    )
+                    instr_store.append(
+                        ("vstore", val_ptrs + g_store, val_cache + g_store * VLEN)
+                    )
+                    state[g_store] = DONE
+                    done_count += 1
+
+            instr: dict[str, list[tuple]] = {}
+            if instr_valu:
+                instr["valu"] = instr_valu
+            if instr_load:
+                instr["load"] = instr_load
+            if instr_store:
+                instr["store"] = instr_store
+
+            if not instr:
+                # Shouldn't happen (would deadlock readiness on `cycle`), but keep safe.
+                instr = {"flow": [("pause",)]}
+
+            main_instrs.append(instr)
+            cycle += 1
+
+        self.instrs.extend(main_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
