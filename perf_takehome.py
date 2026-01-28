@@ -396,7 +396,10 @@ class KernelBuilder:
         period = forest_height + 1
         state = [ROOT_XOR for _ in range(n_groups)]
         g_round = [0 for _ in range(n_groups)]
-        ready = [0 for _ in range(n_groups)]
+        # Stagger group start times to smooth load demand and reduce pipeline
+        # fill/drain bubbles (groups are independent).
+        start_spacing = 2
+        ready = [g * start_spacing for g in range(n_groups)]
         hash_stage = [0 for _ in range(n_groups)]
         postload_xor_off = [0 for _ in range(n_groups)]
 
