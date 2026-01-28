@@ -352,13 +352,49 @@ class KernelBuilder:
         body.append(("valu", ("-", node4_minus_node3_vec, node4_minus_node3_vec, node3_vec)))
         body.append(("valu", ("-", node5_minus_node3_vec, node5_minus_node3_vec, node3_vec)))
         body.append(("valu", ("-", node6_minus_node3_vec, node6_minus_node3_vec, node3_vec)))
-        body.append(("alu", ("+", val_ptrs + 0, self.scratch["inp_values_p"], zero_const)))
-        for g in range(1, n_groups):
-            body.append(("alu", ("+", val_ptrs + g, val_ptrs + g - 1, stride_const)))
-
         # Cache idx/val in scratch to avoid per-round vload/vstore traffic.
-        for g in range(n_groups):
-            body.append(("load", ("vload", val_cache + g * VLEN, val_ptrs + g)))
+        #
+        # We also materialize per-group vload/vstore base pointers (`val_ptrs`)
+        # without a long scalar dependency chain by using 4 independent streams
+        # (blocks of 8 groups). This cuts a large setup bubble before the main
+        # loop starts issuing gather loads.
+        if n_groups != 32:
+            body.append(("alu", ("+", val_ptrs + 0, self.scratch["inp_values_p"], zero_const)))
+            for g in range(1, n_groups):
+                body.append(("alu", ("+", val_ptrs + g, val_ptrs + g - 1, stride_const)))
+            for g in range(n_groups):
+                body.append(("load", ("vload", val_cache + g * VLEN, val_ptrs + g)))
+        else:
+            ptr0 = self.alloc_scratch("val_ptr0")
+            ptr1 = self.alloc_scratch("val_ptr1")
+            ptr2 = self.alloc_scratch("val_ptr2")
+            ptr3 = self.alloc_scratch("val_ptr3")
+            block_stride = self.alloc_scratch("val_ptr_block_stride")
+
+            # block_stride = 8*VLEN = 64
+            body.append(("alu", ("*", block_stride, stride_const, stride_const)))
+            body.append(("alu", ("+", ptr0, self.scratch["inp_values_p"], zero_const)))
+            body.append(("alu", ("+", ptr1, ptr0, block_stride)))
+            body.append(("alu", ("+", ptr2, ptr1, block_stride)))
+            body.append(("alu", ("+", ptr3, ptr2, block_stride)))
+
+            # 16 cycles, 2 vloads/cycle.
+            for i in range(8):
+                g0, g1 = i, 8 + i
+                body.append(("load", ("vload", val_cache + g0 * VLEN, ptr0)))
+                body.append(("load", ("vload", val_cache + g1 * VLEN, ptr1)))
+                body.append(("alu", ("+", val_ptrs + g0, ptr0, zero_const)))
+                body.append(("alu", ("+", val_ptrs + g1, ptr1, zero_const)))
+                body.append(("alu", ("+", ptr0, ptr0, stride_const)))
+                body.append(("alu", ("+", ptr1, ptr1, stride_const)))
+
+                g2, g3 = 16 + i, 24 + i
+                body.append(("load", ("vload", val_cache + g2 * VLEN, ptr2)))
+                body.append(("load", ("vload", val_cache + g3 * VLEN, ptr3)))
+                body.append(("alu", ("+", val_ptrs + g2, ptr2, zero_const)))
+                body.append(("alu", ("+", val_ptrs + g3, ptr3, zero_const)))
+                body.append(("alu", ("+", ptr2, ptr2, stride_const)))
+                body.append(("alu", ("+", ptr3, ptr3, stride_const)))
 
         # Pack the setup/caching phase with the generic VLIW packer.
         body_instrs = self.build(body, vliw=True)
@@ -398,7 +434,7 @@ class KernelBuilder:
         g_round = [0 for _ in range(n_groups)]
         # Stagger group start times to smooth load demand and reduce pipeline
         # fill/drain bubbles (groups are independent).
-        start_spacing = 2
+        start_spacing = 14
         ready = [g * start_spacing for g in range(n_groups)]
         hash_stage = [0 for _ in range(n_groups)]
         postload_xor_off = [0 for _ in range(n_groups)]
