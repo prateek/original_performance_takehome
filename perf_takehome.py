@@ -476,6 +476,8 @@ class KernelBuilder:
         # Precompute contiguous vload/vstore base addresses (reused across all rounds)
         n_groups = batch_size // VLEN
         val_ptrs = self.alloc_scratch("val_ptrs", n_groups)
+        val_ptr_even = self.alloc_scratch("val_ptr_even")
+        val_ptr_odd = self.alloc_scratch("val_ptr_odd")
         idx_cache = self.alloc_scratch("idx_cache", batch_size)
         val_cache = self.alloc_scratch("val_cache", batch_size)
         node_cache = self.alloc_scratch("node_cache", batch_size)
@@ -501,47 +503,24 @@ class KernelBuilder:
         body.append(("valu", ("-", node6_minus_node3_vec, node6_minus_node3_vec, node3_vec)))
         # Cache idx/val in scratch to avoid per-round vload/vstore traffic.
         #
-        # We also materialize per-group vload/vstore base pointers (`val_ptrs`)
-        # without a long scalar dependency chain by using 4 independent streams
-        # (blocks of 8 groups). This cuts a large setup bubble before the main
-        # loop starts issuing gather loads.
-        if n_groups != 32:
-            body.append(("alu", ("+", val_ptrs + 0, self.scratch["inp_values_p"], zero_const)))
-            for g in range(1, n_groups):
-                body.append(("alu", ("+", val_ptrs + g, val_ptrs + g - 1, stride_const)))
-            for g in range(n_groups):
-                body.append(("load", ("vload", val_cache + g * VLEN, val_ptrs + g)))
-        else:
-            ptr0 = self.alloc_scratch("val_ptr0")
-            ptr1 = self.alloc_scratch("val_ptr1")
-            ptr2 = self.alloc_scratch("val_ptr2")
-            ptr3 = self.alloc_scratch("val_ptr3")
-            block_stride = self.alloc_scratch("val_ptr_block_stride")
-
-            # block_stride = 8*VLEN = 64
-            body.append(("alu", ("*", block_stride, stride_const, stride_const)))
-            body.append(("alu", ("+", ptr0, self.scratch["inp_values_p"], zero_const)))
-            body.append(("alu", ("+", ptr1, ptr0, block_stride)))
-            body.append(("alu", ("+", ptr2, ptr1, block_stride)))
-            body.append(("alu", ("+", ptr3, ptr2, block_stride)))
-
-            # 16 cycles, 2 vloads/cycle.
-            for i in range(8):
-                g0, g1 = i, 8 + i
-                body.append(("load", ("vload", val_cache + g0 * VLEN, ptr0)))
-                body.append(("load", ("vload", val_cache + g1 * VLEN, ptr1)))
-                body.append(("alu", ("+", val_ptrs + g0, ptr0, zero_const)))
-                body.append(("alu", ("+", val_ptrs + g1, ptr1, zero_const)))
-                body.append(("alu", ("+", ptr0, ptr0, stride_const)))
-                body.append(("alu", ("+", ptr1, ptr1, stride_const)))
-
-                g2, g3 = 16 + i, 24 + i
-                body.append(("load", ("vload", val_cache + g2 * VLEN, ptr2)))
-                body.append(("load", ("vload", val_cache + g3 * VLEN, ptr3)))
-                body.append(("alu", ("+", val_ptrs + g2, ptr2, zero_const)))
-                body.append(("alu", ("+", val_ptrs + g3, ptr3, zero_const)))
-                body.append(("alu", ("+", ptr2, ptr2, stride_const)))
-                body.append(("alu", ("+", ptr3, ptr3, stride_const)))
+        # Instead of vloading every group's initial values up-front (a large
+        # load-engine bubble), we preload just the first two groups here so the
+        # main loop can start hashing immediately while we stream-load the rest
+        # opportunistically during the early, load-idle cycles.
+        two_stride_const = scratch_const_packed(VLEN * 2)
+        body.append(("alu", ("+", val_ptr_even, self.scratch["inp_values_p"], zero_const)))
+        if n_groups > 1:
+            body.append(("alu", ("+", val_ptr_odd, val_ptr_even, stride_const)))
+        if n_groups > 0:
+            body.append(("load", ("vload", val_cache + 0 * VLEN, val_ptr_even)))
+            body.append(("alu", ("+", val_ptrs + 0, val_ptr_even, zero_const)))
+        if n_groups > 1:
+            body.append(("load", ("vload", val_cache + 1 * VLEN, val_ptr_odd)))
+            body.append(("alu", ("+", val_ptrs + 1, val_ptr_odd, zero_const)))
+        if n_groups > 2:
+            body.append(("alu", ("+", val_ptr_even, val_ptr_even, two_stride_const)))
+        if n_groups > 3:
+            body.append(("alu", ("+", val_ptr_odd, val_ptr_odd, two_stride_const)))
 
         # Pack constants, broadcasts, and the setup/caching phase together so
         # independent load/alu/valu work can overlap in fewer bundles.
@@ -576,9 +555,14 @@ class KernelBuilder:
         DEPTH2_ADD5 = 18
         DEPTH2_ADD6 = 19
         POSTLOAD_XOR = 20
+        INIT_LOAD = 21
 
         period = forest_height + 1
-        state = [ROOT_XOR for _ in range(n_groups)]
+        state = [INIT_LOAD for _ in range(n_groups)]
+        if n_groups > 0:
+            state[0] = ROOT_XOR
+        if n_groups > 1:
+            state[1] = ROOT_XOR
         g_round = [0 for _ in range(n_groups)]
         # Stagger group start times to smooth load demand and reduce pipeline
         # fill/drain bubbles (groups are independent).
@@ -616,6 +600,8 @@ class KernelBuilder:
 
         rr_ptr = 0
         cycle = 0
+        init_even = 2
+        init_odd = 3
         main_instrs: list[dict[str, list[tuple]]] = []
 
         def group_iter(start: int):
@@ -656,6 +642,30 @@ class KernelBuilder:
                             ("load_offset", node_base, addr_buf, load_off)
                         )
                         load_off += 1
+
+            # Load-idle cycles early in the schedule: stream-load remaining groups'
+            # initial `val_cache` vectors and materialize their output pointers.
+            load_budget = SLOT_LIMITS["load"] - len(instr_load)
+            if load_budget > 0 and (init_even < n_groups or init_odd < n_groups):
+                if init_even < n_groups and load_budget > 0:
+                    g_init = init_even
+                    instr_load.append(("vload", val_cache + g_init * VLEN, val_ptr_even))
+                    instr_alu.append(("+", val_ptrs + g_init, val_ptr_even, zero_const))
+                    instr_alu.append(("+", val_ptr_even, val_ptr_even, two_stride_const))
+                    state[g_init] = ROOT_XOR
+                    ready[g_init] = max(ready[g_init], cycle + 1)
+                    init_even += 2
+                    load_budget -= 1
+
+                if init_odd < n_groups and load_budget > 0:
+                    g_init = init_odd
+                    instr_load.append(("vload", val_cache + g_init * VLEN, val_ptr_odd))
+                    instr_alu.append(("+", val_ptrs + g_init, val_ptr_odd, zero_const))
+                    instr_alu.append(("+", val_ptr_odd, val_ptr_odd, two_stride_const))
+                    state[g_init] = ROOT_XOR
+                    ready[g_init] = max(ready[g_init], cycle + 1)
+                    init_odd += 2
+                    load_budget -= 1
 
             # valu engine: keep load pipeline primed by prefetching next group's addresses.
             valu_budget = SLOT_LIMITS["valu"]
@@ -918,7 +928,9 @@ class KernelBuilder:
                         state[g] = DEPTH1_NODE
                         ready[g] = cycle + 1
                     elif st == DEPTH1_NODE:
-                        instr_valu.append(("multiply_add", node_base, t2, node1_minus_node2_vec, node2_vec))
+                        instr_valu.append(
+                            ("multiply_add", node_base, t2, node1_minus_node2_vec, node2_vec)
+                        )
                         state[g] = XOR
                         ready[g] = cycle + 1
                     elif st == STEP_AND:

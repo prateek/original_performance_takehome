@@ -20,3 +20,4 @@
 2026-01-28: Upgrade VLIW slot packing in `KernelBuilder.build` to a dependency-aware list scheduler (RAW/WAW + WAR) to reorder independent slots for tighter bundling; submission cycles now 1414.
 2026-01-28: Pack const loads + vbroadcasts + setup/caching slots into one VLIW build to overlap load/alu/valu; submission cycles now 1409.
 2026-01-28: Retune group start staggering (piecewise start offsets) to reduce pipeline fill bubbles; submission cycles now 1391.
+2026-01-29: Pipeline `val_cache` init: preload first 2 groups in setup, stream remaining `vload`s in early load-idle main-loop cycles (`INIT_LOAD`); submission cycles now 1378.
