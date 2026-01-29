@@ -21,3 +21,4 @@
 2026-01-28: Pack const loads + vbroadcasts + setup/caching slots into one VLIW build to overlap load/alu/valu; submission cycles now 1409.
 2026-01-28: Retune group start staggering (piecewise start offsets) to reduce pipeline fill bubbles; submission cycles now 1391.
 2026-01-29: Pipeline `val_cache` init: preload first 2 groups in setup, stream remaining `vload`s in early load-idle main-loop cycles (`INIT_LOAD`); submission cycles now 1378.
+2026-01-29: Update PRD with current status + next-experiment checklist; submission cycles still 1378.
