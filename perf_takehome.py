@@ -484,6 +484,18 @@ class KernelBuilder:
             nine_const = self.alloc_scratch("nine_const")
             self.const_map[9] = nine_const
             const_slots.append(("alu", ("+", nine_const, stride_const, one_const)))
+        # Reduce setup load-const pressure: derive small shift constants from
+        # existing scalars (avoids extra `load const` slots).
+        if 16 not in self.const_map:
+            sixteen_const = self.alloc_scratch("sixteen_const")
+            self.const_map[16] = sixteen_const
+            const_slots.append(("alu", ("+", sixteen_const, stride_const, stride_const)))
+        if 19 not in self.const_map:
+            nineteen_const = self.alloc_scratch("nineteen_const")
+            self.const_map[19] = nineteen_const
+            # 19 = 16 + 2 + 1
+            const_slots.append(("alu", ("+", nineteen_const, self.const_map[16], two_const)))
+            const_slots.append(("alu", ("+", nineteen_const, nineteen_const, one_const)))
 
         one_vec = self.alloc_scratch("one_vec", VLEN)
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
