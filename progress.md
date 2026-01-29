@@ -39,3 +39,4 @@
 2026-01-29: VLIW packer: switch to global criticality-first slot selection (vs per-engine passes); submission cycles unchanged at 1355.
 2026-01-29: Retune `START_OFFSETS` (g5 `5→0`, g9 `119→95`); submission cycles now 1354.
 2026-01-29: Tried offloading `STEP_AND` (`val & 1`) from `valu` to lane-wise `alu` ops to reduce `valu` saturation; regressed to 1389 cycles, reverted; submission cycles remain 1354.
+2026-01-29: Tried splitting non-fused hash stages and offloading depth-1/2 XOR from `valu` to scalar `alu`; regressed (≥1366 cycles), reverted; submission cycles remain 1354.
