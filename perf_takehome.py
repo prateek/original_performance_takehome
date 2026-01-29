@@ -470,7 +470,39 @@ class KernelBuilder:
         two_const = scratch_const_packed(2)
         zero_const = scratch_const_packed(0)
         stride_const = scratch_const_packed(VLEN)
+        # Reduce setup load-const pressure: derive 33 and 4097 from small scalars.
+        #
+        # - 33 = (8 << 2) + 1
+        if 33 not in self.const_map:
+            mul33_const = self.alloc_scratch("mul33_const")
+            self.const_map[33] = mul33_const
+            thirty_two_const = self.alloc_scratch("thirty_two_const")
+            const_slots.append(("alu", ("<<", thirty_two_const, stride_const, two_const)))
+            const_slots.append(("alu", ("+", mul33_const, thirty_two_const, one_const)))
         mul33_const = scratch_const_packed(33)
+
+        # - 4097 = (1 << 12) + 1, with 12 = 8 + 4 and 4 = 2 + 2.
+        if 4097 not in self.const_map:
+            mul4097_const = self.alloc_scratch("mul4097_const")
+            self.const_map[4097] = mul4097_const
+
+            if 4 not in self.const_map:
+                four_const = self.alloc_scratch("four_const")
+                self.const_map[4] = four_const
+                const_slots.append(("alu", ("+", four_const, two_const, two_const)))
+            else:
+                four_const = self.const_map[4]
+
+            if 12 not in self.const_map:
+                twelve_const = self.alloc_scratch("twelve_const")
+                self.const_map[12] = twelve_const
+                const_slots.append(("alu", ("+", twelve_const, stride_const, four_const)))
+            else:
+                twelve_const = self.const_map[12]
+
+            shift_4096 = self.alloc_scratch("shift_4096")
+            const_slots.append(("alu", ("<<", shift_4096, one_const, twelve_const)))
+            const_slots.append(("alu", ("+", mul4097_const, shift_4096, one_const)))
         mul4097_const = scratch_const_packed(4097)
         # Reduce setup load-const pressure: derive 9 from 8 + 1.
         if 9 not in self.const_map:
@@ -564,8 +596,6 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", node5_minus_node3_vec, forest_nodes0_7 + 5)))
         body.append(("valu", ("vbroadcast", node6_minus_node3_vec, forest_nodes0_7 + 6)))
         body.append(("valu", ("-", node4_minus_node3_vec, node4_minus_node3_vec, node3_vec)))
-        body.append(("valu", ("-", node5_minus_node3_vec, node5_minus_node3_vec, node3_vec)))
-        body.append(("valu", ("-", node6_minus_node3_vec, node6_minus_node3_vec, node3_vec)))
         # Cache idx/val in scratch to avoid per-round vload/vstore traffic.
         #
         # Instead of vloading every group's initial values up-front (a large
@@ -609,14 +639,8 @@ class KernelBuilder:
         forest_p_plus_two_vec = self.alloc_scratch("forest_p_plus_two_vec", VLEN)
         one_minus_forest_p_vec = self.alloc_scratch("one_minus_forest_p_vec", VLEN)
         two_minus_forest_p_vec = self.alloc_scratch("two_minus_forest_p_vec", VLEN)
-        vector_slots.append(("valu", ("vbroadcast", forest_p_plus_one_vec, forest_p_plus_one)))
-        vector_slots.append(("valu", ("vbroadcast", forest_p_plus_two_vec, forest_p_plus_two)))
-        vector_slots.append(
-            ("valu", ("vbroadcast", one_minus_forest_p_vec, one_minus_forest_p))
-        )
-        vector_slots.append(
-            ("valu", ("vbroadcast", two_minus_forest_p_vec, two_minus_forest_p))
-        )
+        # Defer broadcasting these pointer constants until the early main-loop
+        # slack cycles (reduces setup load/valu pressure).
 
         # Pack constants, broadcasts, and the setup/caching phase together so
         # independent load/alu/valu work can overlap in fewer bundles.
@@ -705,6 +729,15 @@ class KernelBuilder:
         cycle = 0
         init_even = 2
         init_odd = 3
+        ptr_bcast = [
+            ("vbroadcast", forest_p_plus_one_vec, forest_p_plus_one),
+            ("vbroadcast", forest_p_plus_two_vec, forest_p_plus_two),
+            ("vbroadcast", one_minus_forest_p_vec, one_minus_forest_p),
+            ("vbroadcast", two_minus_forest_p_vec, two_minus_forest_p),
+            ("-", node5_minus_node3_vec, node5_minus_node3_vec, node3_vec),
+            ("-", node6_minus_node3_vec, node6_minus_node3_vec, node3_vec),
+        ]
+        ptr_bcast_i = 0
         main_instrs: list[dict[str, list[tuple]]] = []
 
         def group_iter(start: int):
@@ -1033,6 +1066,12 @@ class KernelBuilder:
                     break
 
                 if scheduled:
+                    continue
+
+                if ptr_bcast_i < len(ptr_bcast):
+                    instr_valu.append(ptr_bcast[ptr_bcast_i])
+                    ptr_bcast_i += 1
+                    valu_budget -= 1
                     continue
                 break
 
