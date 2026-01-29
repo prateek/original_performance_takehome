@@ -22,3 +22,4 @@
 2026-01-28: Retune group start staggering (piecewise start offsets) to reduce pipeline fill bubbles; submission cycles now 1391.
 2026-01-29: Pipeline `val_cache` init: preload first 2 groups in setup, stream remaining `vload`s in early load-idle main-loop cycles (`INIT_LOAD`); submission cycles now 1378.
 2026-01-29: Update PRD with current status + next-experiment checklist; submission cycles still 1378.
+2026-01-29: Re-ran submission harness; cycles still 1378. Static schedule analysis: load=2 on 1308/1378 cycles, with 69 load-idle cycles (largest runs 31–66 and 1367–1377).
