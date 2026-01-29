@@ -35,6 +35,13 @@ from problem import (
     reference_kernel2,
 )
 
+# Tuning knobs for the group-interleaved software pipeline schedule in
+# `KernelBuilder.build_kernel`. These defaults are chosen for the authoritative
+# submission harness parameters (forest_height=10, rounds=16, batch_size=256).
+START_EARLY_GROUPS = 4
+START_EARLY_SPACING = 4
+START_LATE_SPACING = 16
+
 
 class KernelBuilder:
     def __init__(self):
@@ -570,9 +577,9 @@ class KernelBuilder:
         # A piecewise schedule starts the first few groups closer together to
         # fill the valu pipeline early, then uses a wider spacing for the rest
         # to maintain a steady load/valu overlap once gathers begin.
-        early_groups = 4
-        early_spacing = 4
-        late_spacing = 16
+        early_groups = START_EARLY_GROUPS
+        early_spacing = START_EARLY_SPACING
+        late_spacing = START_LATE_SPACING
         ready = [
             (g * early_spacing)
             if g < early_groups
