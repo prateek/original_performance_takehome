@@ -37,3 +37,4 @@
 2026-01-29: Derive `33`/`4097` multiplier scalars via ALU and defer pointer-vector broadcasts + `node{5,6}-node3` delta subtracts into early main-loop slack to shrink setup by one more cycle; submission cycles now 1355.
 2026-01-29: Relax VLIW scheduler intra-bundle hazard to allow reads of written scratch (writes commit end-of-cycle); submission cycles unchanged at 1355.
 2026-01-29: VLIW packer: switch to global criticality-first slot selection (vs per-engine passes); submission cycles unchanged at 1355.
+2026-01-29: Retune `START_OFFSETS` (g5 `5→0`, g9 `119→95`); submission cycles now 1354.
