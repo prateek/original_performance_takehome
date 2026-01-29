@@ -27,3 +27,4 @@
 2026-01-29: Tune per-group `START_OFFSETS` schedule (override piecewise staggering) to reduce load-idle bubbles; submission cycles now 1368.
 2026-01-29: Retune `START_OFFSETS`; submission cycles now 1367.
 2026-01-29: Improve VLIW packer heuristic (criticality-based candidate selection) to reduce setup bundles; submission cycles now 1365.
+2026-01-29: Reduce setup load-const pressure (implicit zero scalar; derive `idx{4,5,6}_vec` from `one_vec`/`two_vec`; skip vector constants for fused-stage shift amounts); submission cycles now 1362.

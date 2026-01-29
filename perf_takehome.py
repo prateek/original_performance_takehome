@@ -460,6 +460,10 @@ class KernelBuilder:
 
         # Pack constant materialization and broadcasts to reduce init overhead.
         const_slots: list[tuple[Engine, tuple]] = []
+        # Scratch is zero-initialized, so we can reserve a dedicated zero scalar
+        # without spending a load-engine slot on `const 0`.
+        zero_scalar = self.alloc_scratch("zero_scalar")
+        self.const_map[0] = zero_scalar
 
         def scratch_const_packed(val: int, name: str | None = None) -> int:
             if val not in self.const_map:
@@ -475,10 +479,6 @@ class KernelBuilder:
         stride_const = scratch_const_packed(VLEN)
         mul33_const = scratch_const_packed(33)
         mul4097_const = scratch_const_packed(4097)
-        three_const = scratch_const_packed(3)
-        four_const = scratch_const_packed(4)
-        five_const = scratch_const_packed(5)
-        six_const = scratch_const_packed(6)
 
         one_vec = self.alloc_scratch("one_vec", VLEN)
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
@@ -502,17 +502,21 @@ class KernelBuilder:
         vector_slots: list[tuple[Engine, tuple]] = [
             ("valu", ("vbroadcast", one_vec, one_const)),
             ("valu", ("vbroadcast", two_vec, two_const)),
-            ("valu", ("vbroadcast", idx4_vec, four_const)),
-            ("valu", ("vbroadcast", idx5_vec, five_const)),
-            ("valu", ("vbroadcast", idx6_vec, six_const)),
+            ("valu", ("+", idx4_vec, two_vec, two_vec)),
+            ("valu", ("+", idx5_vec, idx4_vec, one_vec)),
+            ("valu", ("+", idx6_vec, idx4_vec, two_vec)),
             ("valu", ("vbroadcast", mul33_vec, mul33_const)),
             ("valu", ("vbroadcast", mul4097_vec, mul4097_const)),
         ]
 
         # Vector constants used by the hash stages
         vec_const_map = {}
-        for op1, val1, op2, op3, val3 in HASH_STAGES:
-            for v in (val1, val3):
+        fused_hash_stages = {0, 2, 4}
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            needed = [val1]
+            if hi not in fused_hash_stages:
+                needed.append(val3)
+            for v in needed:
                 if v in vec_const_map:
                     continue
                 v_scalar = scratch_const_packed(v)
