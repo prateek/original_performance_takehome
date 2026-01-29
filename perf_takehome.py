@@ -479,6 +479,11 @@ class KernelBuilder:
         stride_const = scratch_const_packed(VLEN)
         mul33_const = scratch_const_packed(33)
         mul4097_const = scratch_const_packed(4097)
+        # Reduce setup load-const pressure: derive 9 from 8 + 1.
+        if 9 not in self.const_map:
+            nine_const = self.alloc_scratch("nine_const")
+            self.const_map[9] = nine_const
+            const_slots.append(("alu", ("+", nine_const, stride_const, one_const)))
 
         one_vec = self.alloc_scratch("one_vec", VLEN)
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
