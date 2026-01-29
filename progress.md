@@ -25,3 +25,4 @@
 2026-01-29: Re-ran submission harness; cycles still 1378. Static schedule analysis: load=2 on 1308/1378 cycles, with 69 load-idle cycles (largest runs 31–66 and 1367–1377).
 2026-01-29: Expose start-stagger knobs as constants and brute-force a small grid (early_groups/early_spacing/late_spacing); no improvement found, best remains 1378.
 2026-01-29: Tune per-group `START_OFFSETS` schedule (override piecewise staggering) to reduce load-idle bubbles; submission cycles now 1368.
+2026-01-29: Retune `START_OFFSETS`; submission cycles now 1367.
