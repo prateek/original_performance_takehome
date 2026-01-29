@@ -274,6 +274,7 @@ class KernelBuilder:
             remaining = n
             out: list[dict[str, list[tuple]]] = []
             engine_order = ("load", "store", "flow", "valu", "alu")
+            engine_rank = {engine: r for r, engine in enumerate(engine_order)}
 
             while remaining:
                 cur: dict[str, list[tuple]] = {}
@@ -281,44 +282,49 @@ class KernelBuilder:
                 engine_counts: dict[str, int] = {}
                 scheduled_this_cycle: list[int] = []
 
-                made_progress = True
-                while made_progress:
-                    made_progress = False
-                    for engine in engine_order:
+                while True:
+                    cand: int | None = None
+                    cand_engine: str | None = None
+                    for i in ready:
+                        engine = engines[i]
                         limit = SLOT_LIMITS.get(engine, 1)
-                        while engine_counts.get(engine, 0) < limit:
-                            cand: int | None = None
-                            for i in ready:
-                                if engines[i] != engine:
-                                    continue
-                                if writes[i] & written:
-                                    continue
-                                if cand is None or crit[i] > crit[cand] or (
-                                    crit[i] == crit[cand] and i < cand
-                                ):
-                                    cand = i
+                        if engine_counts.get(engine, 0) >= limit:
+                            continue
+                        if writes[i] & written:
+                            continue
+                        if cand is None:
+                            cand = i
+                            cand_engine = engine
+                            continue
 
-                            if cand is None:
-                                break
+                        cand_rank = engine_rank.get(cand_engine or "", 0)
+                        engine_r = engine_rank.get(engine, 0)
+                        if crit[i] > crit[cand] or (
+                            crit[i] == crit[cand]
+                            and (engine_r < cand_rank or (engine_r == cand_rank and i < cand))
+                        ):
+                            cand = i
+                            cand_engine = engine
 
-                            ready.remove(cand)
-                            scheduled[cand] = True
-                            remaining -= 1
-                            engine_counts[engine] = engine_counts.get(engine, 0) + 1
-                            cur.setdefault(engine, []).append(slots_only[cand])
-                            written.update(writes[cand])
-                            scheduled_this_cycle.append(cand)
+                    if cand is None or cand_engine is None:
+                        break
 
-                            for succ in succ0[cand]:
-                                pred0_count[succ] -= 1
-                                if (
-                                    pred0_count[succ] == 0
-                                    and pred1_count[succ] == 0
-                                    and not scheduled[succ]
-                                ):
-                                    ready.add(succ)
+                    ready.remove(cand)
+                    scheduled[cand] = True
+                    remaining -= 1
+                    engine_counts[cand_engine] = engine_counts.get(cand_engine, 0) + 1
+                    cur.setdefault(cand_engine, []).append(slots_only[cand])
+                    written.update(writes[cand])
+                    scheduled_this_cycle.append(cand)
 
-                            made_progress = True
+                    for succ in succ0[cand]:
+                        pred0_count[succ] -= 1
+                        if (
+                            pred0_count[succ] == 0
+                            and pred1_count[succ] == 0
+                            and not scheduled[succ]
+                        ):
+                            ready.add(succ)
 
                 if not cur:
                     # If we couldn't pack anything (should be rare), emit the next
