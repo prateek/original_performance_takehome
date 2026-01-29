@@ -41,6 +41,43 @@ from problem import (
 START_EARLY_GROUPS = 4
 START_EARLY_SPACING = 4
 START_LATE_SPACING = 16
+# Optional per-group start offsets (in cycles) for the main software pipeline.
+# When provided (and sized correctly), these override the piecewise spacing knobs
+# above.
+START_OFFSETS: list[int] | None = [
+    0,
+    0,
+    2,
+    2,
+    9,
+    11,
+    50,
+    58,
+    74,
+    120,
+    120,
+    154,
+    154,
+    179,
+    179,
+    232,
+    256,
+    275,
+    283,
+    283,
+    291,
+    303,
+    309,
+    317,
+    367,
+    373,
+    392,
+    502,
+    575,
+    622,
+    683,
+    698,
+]
 
 
 class KernelBuilder:
@@ -577,15 +614,18 @@ class KernelBuilder:
         # A piecewise schedule starts the first few groups closer together to
         # fill the valu pipeline early, then uses a wider spacing for the rest
         # to maintain a steady load/valu overlap once gathers begin.
-        early_groups = START_EARLY_GROUPS
-        early_spacing = START_EARLY_SPACING
-        late_spacing = START_LATE_SPACING
-        ready = [
-            (g * early_spacing)
-            if g < early_groups
-            else (early_groups * early_spacing + (g - early_groups) * late_spacing)
-            for g in range(n_groups)
-        ]
+        if START_OFFSETS is not None and len(START_OFFSETS) == n_groups:
+            ready = list(START_OFFSETS)
+        else:
+            early_groups = START_EARLY_GROUPS
+            early_spacing = START_EARLY_SPACING
+            late_spacing = START_LATE_SPACING
+            ready = [
+                (g * early_spacing)
+                if g < early_groups
+                else (early_groups * early_spacing + (g - early_groups) * late_spacing)
+                for g in range(n_groups)
+            ]
         hash_stage = [0 for _ in range(n_groups)]
         postload_xor_off = [0 for _ in range(n_groups)]
 
