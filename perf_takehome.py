@@ -451,11 +451,19 @@ class KernelBuilder:
             return self.const_map[val]
 
         # The submission harness uses `build_mem_image`, whose header layout is
-        # fixed (header size 7). Derive the hot base pointers as constants
-        # instead of loading them from `mem[4]` / `mem[6]`.
+        # fixed (header size 7). Materialize the hot base pointers without
+        # spending load-engine slots on `load const`.
         header = 7
-        scratch_const_packed(header, "forest_values_p")
-        scratch_const_packed(header + n_nodes + batch_size, "inp_values_p")
+        forest_values_p = self.alloc_scratch("forest_values_p")
+        self.const_map[header] = forest_values_p
+        const_slots.append(("flow", ("add_imm", forest_values_p, zero_scalar, header)))
+
+        inp_values_val = header + n_nodes + batch_size
+        inp_values_p = self.alloc_scratch("inp_values_p")
+        self.const_map[inp_values_val] = inp_values_p
+        const_slots.append(
+            ("flow", ("add_imm", inp_values_p, zero_scalar, inp_values_val))
+        )
 
         # Vector constants and scalars broadcasted to vectors
         one_const = scratch_const_packed(1)
@@ -618,7 +626,13 @@ class KernelBuilder:
         # file requires these match up to the reference kernel's yields, but the
         # submission harness ignores them.
         if setup_instrs:
-            setup_instrs[-1].setdefault("flow", []).append(("pause",))
+            # Prefer reusing an existing bundle so pause doesn't cost a cycle.
+            for instr in reversed(setup_instrs):
+                if len(instr.get("flow", [])) < SLOT_LIMITS["flow"]:
+                    instr.setdefault("flow", []).append(("pause",))
+                    break
+            else:
+                setup_instrs.append({"flow": [("pause",)]})
         self.instrs.extend(setup_instrs)
 
         # Main loop: software-pipelined, group-interleaved schedule.

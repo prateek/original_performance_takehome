@@ -32,3 +32,4 @@
 2026-01-29: Reduce setup load-const pressure further by deriving shift constants `16` (`8+8`) and `19` (`16+2+1`) via ALU adds instead of `load const`; submission cycles now 1360.
 2026-01-29: Keep `idx_cache` as forest addresses for depths >=3 so gather loads read directly from `idx_cache` (no address-prefetch stage); retune `START_OFFSETS`; submission cycles now 1360.
 2026-01-29: Eliminate prologue header loads by deriving `forest_values_p`/`inp_values_p` as constants (fixed `build_mem_image` header=7); submission cycles now 1359.
+2026-01-29: Materialize `forest_values_p`/`inp_values_p` via `flow add_imm` (avoid two `load const` slots; setup `8→7` cycles); submission cycles now 1358.
