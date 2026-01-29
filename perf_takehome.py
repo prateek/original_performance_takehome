@@ -260,6 +260,13 @@ class KernelBuilder:
                     for addr in rset:
                         pending_reads.setdefault(addr, []).append(i)
 
+            # Simple criticality metric: the longest remaining chain of latency-1
+            # deps from each slot. Helps prioritize work on the critical path.
+            crit = [0 for _ in range(n)]
+            for i in range(n - 1, -1, -1):
+                if succ1[i]:
+                    crit[i] = 1 + max(crit[j] for j in succ1[i])
+
             ready: set[int] = {
                 i for i in range(n) if pred0_count[i] == 0 and pred1_count[i] == 0
             }
@@ -288,7 +295,9 @@ class KernelBuilder:
                                     continue
                                 if writes[i] & written:
                                     continue
-                                if cand is None or i < cand:
+                                if cand is None or crit[i] > crit[cand] or (
+                                    crit[i] == crit[cand] and i < cand
+                                ):
                                     cand = i
 
                             if cand is None:
