@@ -35,3 +35,4 @@
 2026-01-29: Materialize `forest_values_p`/`inp_values_p` via `flow add_imm` (avoid two `load const` slots; setup `8→7` cycles); submission cycles now 1358.
 2026-01-29: Retune per-group `START_OFFSETS` via multi-parameter random search to improve overlap; submission cycles now 1356.
 2026-01-29: Derive `33`/`4097` multiplier scalars via ALU and defer pointer-vector broadcasts + `node{5,6}-node3` delta subtracts into early main-loop slack to shrink setup by one more cycle; submission cycles now 1355.
+2026-01-29: Relax VLIW scheduler intra-bundle hazard to allow reads of written scratch (writes commit end-of-cycle); submission cycles unchanged at 1355.

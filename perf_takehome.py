@@ -291,8 +291,6 @@ class KernelBuilder:
                             for i in ready:
                                 if engines[i] != engine:
                                     continue
-                                if reads[i] & written:
-                                    continue
                                 if writes[i] & written:
                                     continue
                                 if cand is None or crit[i] > crit[cand] or (
