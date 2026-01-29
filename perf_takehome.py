@@ -47,36 +47,36 @@ START_LATE_SPACING = 16
 START_OFFSETS: list[int] | None = [
     0,
     0,
-    2,
-    2,
-    9,
-    11,
-    50,
-    71,
-    74,
-    120,
-    120,
-    154,
-    154,
-    179,
-    179,
-    232,
-    256,
-    275,
-    283,
-    263,
-    291,
-    303,
-    286,
-    317,
-    367,
-    373,
-    392,
-    502,
-    575,
-    622,
-    683,
-    698,
+    3,
+    0,
+    4,
+    5,
+    51,
+    67,
+    65,
+    119,
+    115,
+    148,
+    156,
+    176,
+    175,
+    228,
+    242,
+    272,
+    281,
+    259,
+    288,
+    293,
+    287,
+    312,
+    372,
+    369,
+    380,
+    501,
+    572,
+    612,
+    682,
+    705,
 ]
 
 
@@ -556,8 +556,6 @@ class KernelBuilder:
         val_cache = self.alloc_scratch("val_cache", batch_size)
         node_cache = self.alloc_scratch("node_cache", batch_size)
         tmp_hash2_arr = self.alloc_scratch("tmp_hash2_arr", batch_size)
-        addr_buf0 = self.alloc_scratch("addr_buf0", VLEN)
-        addr_buf1 = self.alloc_scratch("addr_buf1", VLEN)
         forest_nodes0_7 = self.alloc_scratch("forest_nodes0_7", VLEN)
         # Load small, frequently-used forest nodes once and materialize vectors for
         # fast-path rounds where indices are known to be in {0,1,2}.
@@ -596,6 +594,37 @@ class KernelBuilder:
         if n_groups > 3:
             body.append(("alu", ("+", val_ptr_odd, val_ptr_odd, two_stride_const)))
 
+        # Derived forest-base constants used to keep `idx_cache` in one of two
+        # representations:
+        # - Depths 0–2: indices (0..n_nodes)
+        # - Depths >=3: memory addresses (forest_values_p + idx)
+        #
+        # This lets gather rounds load directly from `idx_cache` (address array),
+        # eliminating the per-load address prefetch stage and reducing load-engine
+        # bubbles without adding valu pressure.
+        forest_values_p = self.scratch["forest_values_p"]
+        forest_p_plus_one = self.alloc_scratch("forest_p_plus_one")
+        forest_p_plus_two = self.alloc_scratch("forest_p_plus_two")
+        one_minus_forest_p = self.alloc_scratch("one_minus_forest_p")
+        two_minus_forest_p = self.alloc_scratch("two_minus_forest_p")
+        const_slots.append(("alu", ("+", forest_p_plus_one, forest_values_p, one_const)))
+        const_slots.append(("alu", ("+", forest_p_plus_two, forest_values_p, two_const)))
+        const_slots.append(("alu", ("-", one_minus_forest_p, one_const, forest_values_p)))
+        const_slots.append(("alu", ("-", two_minus_forest_p, two_const, forest_values_p)))
+
+        forest_p_plus_one_vec = self.alloc_scratch("forest_p_plus_one_vec", VLEN)
+        forest_p_plus_two_vec = self.alloc_scratch("forest_p_plus_two_vec", VLEN)
+        one_minus_forest_p_vec = self.alloc_scratch("one_minus_forest_p_vec", VLEN)
+        two_minus_forest_p_vec = self.alloc_scratch("two_minus_forest_p_vec", VLEN)
+        vector_slots.append(("valu", ("vbroadcast", forest_p_plus_one_vec, forest_p_plus_one)))
+        vector_slots.append(("valu", ("vbroadcast", forest_p_plus_two_vec, forest_p_plus_two)))
+        vector_slots.append(
+            ("valu", ("vbroadcast", one_minus_forest_p_vec, one_minus_forest_p))
+        )
+        vector_slots.append(
+            ("valu", ("vbroadcast", two_minus_forest_p_vec, two_minus_forest_p))
+        )
+
         # Pack constants, broadcasts, and the setup/caching phase together so
         # independent load/alu/valu work can overlap in fewer bundles.
         setup_instrs = self.build(const_slots + vector_slots + body, vliw=True)
@@ -606,11 +635,9 @@ class KernelBuilder:
         # We keep per-group idx/val in scratch (idx_cache/val_cache) and overlap:
         # - load engine: scalar gathers into node_cache (2 loads/cycle)
         # - valu engine: hash + idx update across multiple groups (6 valu slots/cycle)
-        addr_bufs = [addr_buf0, addr_buf1]
 
         # Per-group state machine. Groups are independent, so we can interleave rounds.
         LOAD = 0
-        PREFETCHED = 1
         ROOT_XOR = 2
         DEPTH1_MASK = 3
         DEPTH1_NODE = 4
@@ -666,14 +693,8 @@ class KernelBuilder:
         xor_queue: deque[int] = deque()
 
         load_group: int | None = None
-        load_buf_idx: int | None = None
         load_off = 0
         load_xor_off = 0
-
-        prefetch_group: int | None = None
-        prefetch_buf_idx: int | None = None
-        prefetch_ready = 0
-        buf_toggle = 0
 
         rr_ptr = 0
         cycle = 0
@@ -693,30 +714,29 @@ class KernelBuilder:
             instr_store: list[tuple] = []
             instr_flow: list[tuple] = []
 
-            # Promote prefetched group to active loader when ready.
-            if (
-                load_group is None
-                and prefetch_group is not None
-                and cycle >= prefetch_ready
-            ):
-                load_group = prefetch_group
-                load_buf_idx = prefetch_buf_idx
-                load_off = 0
-                load_xor_off = 0
-                prefetch_group = None
-                prefetch_buf_idx = None
+            # Select an active loader when available.
+            if load_group is None and load_queue:
+                for _ in range(len(load_queue)):
+                    cand = load_queue[0]
+                    if state[cand] == LOAD and ready[cand] <= cycle:
+                        load_group = cand
+                        load_queue.popleft()
+                        load_off = 0
+                        load_xor_off = 0
+                        break
+                    load_queue.append(load_queue.popleft())
 
             # Load engine: 2 scalar gathers per cycle for the active load_group.
             load_off_start: int | None = None
-            if load_group is not None and load_buf_idx is not None:
+            if load_group is not None:
                 g = load_group
-                addr_buf = addr_bufs[load_buf_idx]
+                idx_base = idx_cache + g * VLEN
                 node_base = node_cache + g * VLEN
                 load_off_start = load_off
                 for _ in range(SLOT_LIMITS["load"]):
                     if load_off < VLEN:
                         instr_load.append(
-                            ("load_offset", node_base, addr_buf, load_off)
+                            ("load_offset", node_base, idx_base, load_off)
                         )
                         load_off += 1
 
@@ -744,39 +764,7 @@ class KernelBuilder:
                     init_odd += 2
                     load_budget -= 1
 
-            # valu engine: keep load pipeline primed by prefetching next group's addresses.
             valu_budget = SLOT_LIMITS["valu"]
-            if prefetch_group is None:
-                g_pref = None
-                for _ in range(len(load_queue)):
-                    cand = load_queue[0]
-                    if state[cand] == LOAD and ready[cand] <= cycle:
-                        g_pref = cand
-                        load_queue.popleft()
-                        break
-                    load_queue.append(load_queue.popleft())
-
-                if g_pref is not None:
-                    if load_buf_idx is not None:
-                        buf_idx = 1 - load_buf_idx
-                    else:
-                        buf_idx = buf_toggle
-                        buf_toggle = 1 - buf_toggle
-                    idx_base = idx_cache + g_pref * VLEN
-                    forest_values_p = self.scratch["forest_values_p"]
-                    for vi in range(VLEN):
-                        instr_alu.append(
-                            (
-                                "+",
-                                addr_bufs[buf_idx] + vi,
-                                forest_values_p,
-                                idx_base + vi,
-                            )
-                        )
-                    prefetch_group = g_pref
-                    prefetch_buf_idx = buf_idx
-                    prefetch_ready = cycle + 1
-                    state[g_pref] = PREFETCHED
 
             # ALU engine: overlap lane-wise XOR with gather loads to save valu bandwidth.
             alu_budget = SLOT_LIMITS["alu"] - len(instr_alu)
@@ -807,7 +795,6 @@ class KernelBuilder:
             if (
                 alu_budget > 0
                 and load_group is not None
-                and load_buf_idx is not None
                 and load_off_start is not None
             ):
                 g = load_group
@@ -825,7 +812,7 @@ class KernelBuilder:
                     load_xor_off += 1
                     alu_budget -= 1
 
-            if load_group is not None and load_buf_idx is not None and load_off >= VLEN:
+            if load_group is not None and load_off >= VLEN:
                 # Remaining lanes were loaded this cycle; finish XOR next cycle.
                 g = load_group
                 state[g] = POSTLOAD_XOR
@@ -833,7 +820,6 @@ class KernelBuilder:
                 ready[g] = cycle + 1
                 xor_queue.append(g)
                 load_group = None
-                load_buf_idx = None
 
             def find_ready(target_state: int):
                 nonlocal rr_ptr
@@ -1065,7 +1051,17 @@ class KernelBuilder:
                     g_flow = find_ready(STEP_SELECT)
                     if g_flow is not None:
                         t1 = node_cache + g_flow * VLEN
-                        instr_flow.append(("vselect", t1, t1, two_vec, one_vec))
+                        depth = g_round[g_flow] % period
+                        if depth == 2:
+                            a = forest_p_plus_two_vec
+                            b = forest_p_plus_one_vec
+                        elif depth >= 3:
+                            a = two_minus_forest_p_vec
+                            b = one_minus_forest_p_vec
+                        else:
+                            a = two_vec
+                            b = one_vec
+                        instr_flow.append(("vselect", t1, t1, a, b))
                         state[g_flow] = IDX_MAD
                         ready[g_flow] = cycle + 1
 
