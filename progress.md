@@ -48,3 +48,4 @@
 2026-01-30: Re-ran authoritative submission tests to revalidate 1354 cycles; updated PRD with the latest schedule snapshot.
 2026-01-30: VLIW packer: include latency-0 deps in the criticality metric; submission cycles unchanged at 1354.
 2026-01-30: Tried depth-3 fast path (idx in {7..14}) via preloaded nodes[8..15] + flow `vselect` LUT (ALU bit extraction); regressed to 1435 cycles, reverted; cycles remain 1354.
+2026-01-30: Main-loop scheduler: rotate ALU XOR `xor_queue` selection to avoid head-of-line blocking when some POSTLOAD_XOR groups aren’t ready; re-ran submission harness, cycles still 1354.

@@ -816,8 +816,14 @@ class KernelBuilder:
             # ALU engine: overlap lane-wise XOR with gather loads to save valu bandwidth.
             alu_budget = SLOT_LIMITS["alu"] - len(instr_alu)
             while alu_budget > 0 and xor_queue:
-                g_xor = xor_queue[0]
-                if ready[g_xor] > cycle:
+                g_xor = None
+                for _ in range(len(xor_queue)):
+                    cand = xor_queue[0]
+                    if ready[cand] <= cycle:
+                        g_xor = cand
+                        break
+                    xor_queue.append(xor_queue.popleft())
+                if g_xor is None:
                     break
 
                 off = postload_xor_off[g_xor]
