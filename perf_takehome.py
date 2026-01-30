@@ -261,11 +261,16 @@ class KernelBuilder:
                         pending_reads.setdefault(addr, []).append(i)
 
             # Simple criticality metric: the longest remaining chain of latency-1
-            # deps from each slot. Helps prioritize work on the critical path.
+            # deps from each slot. Include latency-0 deps so we prefer ordering
+            # slots that unlock long chains within the same cycle.
             crit = [0 for _ in range(n)]
             for i in range(n - 1, -1, -1):
+                best = 0
+                if succ0[i]:
+                    best = max(best, max(crit[j] for j in succ0[i]))
                 if succ1[i]:
-                    crit[i] = 1 + max(crit[j] for j in succ1[i])
+                    best = max(best, 1 + max(crit[j] for j in succ1[i]))
+                crit[i] = best
 
             ready: set[int] = {
                 i for i in range(n) if pred0_count[i] == 0 and pred1_count[i] == 0
