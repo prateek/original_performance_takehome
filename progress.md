@@ -42,3 +42,4 @@
 2026-01-29: Tried splitting non-fused hash stages and offloading depth-1/2 XOR from `valu` to scalar `alu`; regressed (≥1366 cycles), reverted; submission cycles remain 1354.
 2026-01-30: Add `analyze_schedule.py` to print static schedule utilization/idle runs for the built kernel; submission cycles remain 1354.
 2026-01-30: Add `tune_start_offsets.py` to automate quick `START_OFFSETS` hill-climb searches; re-ran `python tests/submission_tests.py`, cycles still 1354.
+2026-01-30: Re-ran `python tests/submission_tests.py` (authoritative) and did a small targeted `START_OFFSETS` perturbation sweep; no improvement found (best remains 1354).
