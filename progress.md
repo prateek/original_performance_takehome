@@ -44,3 +44,4 @@
 2026-01-30: Add `tune_start_offsets.py` to automate quick `START_OFFSETS` hill-climb searches; re-ran `python tests/submission_tests.py`, cycles still 1354.
 2026-01-30: Re-ran `python tests/submission_tests.py` (authoritative) and did a small targeted `START_OFFSETS` perturbation sweep; no improvement found (best remains 1354).
 2026-01-30: Longer `START_OFFSETS` hill-climb (`python tune_start_offsets.py --iters 20000 --seed 2 --max-delta 32 --multi 2`); no improvement (best remains 1354). Re-ran authoritative submission tests; cycles still 1354.
+2026-01-30: Tried offloading depth-2 fast-path `idx=={4,5,6}` compares from `valu` to lane-wise `alu`; regressed to 1388 cycles, reverted; cycles remain 1354.
