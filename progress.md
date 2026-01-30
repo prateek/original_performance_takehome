@@ -47,3 +47,4 @@
 2026-01-30: Tried offloading depth-2 fast-path `idx=={4,5,6}` compares from `valu` to lane-wise `alu`; regressed to 1388 cycles, reverted; cycles remain 1354.
 2026-01-30: Re-ran authoritative submission tests to revalidate 1354 cycles; updated PRD with the latest schedule snapshot.
 2026-01-30: VLIW packer: include latency-0 deps in the criticality metric; submission cycles unchanged at 1354.
+2026-01-30: Tried depth-3 fast path (idx in {7..14}) via preloaded nodes[8..15] + flow `vselect` LUT (ALU bit extraction); regressed to 1435 cycles, reverted; cycles remain 1354.
