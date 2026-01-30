@@ -49,3 +49,4 @@
 2026-01-30: VLIW packer: include latency-0 deps in the criticality metric; submission cycles unchanged at 1354.
 2026-01-30: Tried depth-3 fast path (idx in {7..14}) via preloaded nodes[8..15] + flow `vselect` LUT (ALU bit extraction); regressed to 1435 cycles, reverted; cycles remain 1354.
 2026-01-30: Main-loop scheduler: rotate ALU XOR `xor_queue` selection to avoid head-of-line blocking when some POSTLOAD_XOR groups aren’t ready; re-ran submission harness, cycles still 1354.
+2026-01-30: Tried offloading depth 0–2 XORs to lane-wise scalar ALU XORs (opportunistic, only when ALU budget allowed); static schedule regressed to 1397 cycles, reverted; submission cycles remain 1354.
