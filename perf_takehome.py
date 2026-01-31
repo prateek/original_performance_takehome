@@ -1,8 +1,5 @@
 """
-# Anthropic's Original Performance Engineering Take-home (Release version)
-
-Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
-to publish or redistribute your solutions so it's hard to find spoilers.
+Copyright Anthropic PBC 2026. Permission is granted to modify and use
 
 # Task
 
